@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache imp
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_deepseek_v4_kv_rope_insert import (
+    fused_deepseek_v4_kv_rope_insert,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
@@ -133,6 +136,7 @@ __all__ = [
     "compute_slot_mapping_parallel",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
+    "fused_deepseek_v4_kv_rope_insert",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
