@@ -75,7 +75,9 @@ def encode_e4m3(values):
     normal = (exponent.to(torch.int32) + 7) * 8 + rounded - 8
     encoded = torch.where(magnitude >= 2.0**-6, normal, rounded)
     encoded = torch.where(torch.isnan(values), 0x7F, encoded)
-    sign = torch.signbit(values).to(torch.int32) * 128
+    # Some NPU signbit implementations drop the sign of -0.0. Read the IEEE
+    # sign directly while keeping the independent arithmetic rounding above.
+    sign = (values.view(torch.int32) >> 24) & 0x80
     return (sign | encoded).to(torch.uint8)
 
 
