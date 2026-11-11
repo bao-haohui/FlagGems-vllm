@@ -38,9 +38,9 @@ files were imported; unrelated upstream changes were excluded.
 
 ## Validation boundaries
 
-The development host is macOS ARM without CANN/Triton Ascend or an NPU. Python
-compilation, CPU reference checks, packaging, and linting are local checks;
-they do not establish successful NPU kernel compilation or performance.
+Initial development used macOS ARM without CANN/Triton Ascend or an NPU.
+Python compilation, CPU reference checks, packaging, and linting are local
+checks; subsequent Linux/NPU validation is reported separately below.
 
 An independent Torch reference belongs only to `baseline/`; production code
 never imports it. Device tests run against it when the CUDA native op is
@@ -68,9 +68,9 @@ This CPU environment is not a recommendation for the NPU server stack.
   Ascend override. Building this pure-Python package does not compile kernels.
 - Host production audit: device-property/context calls and no-copy dtype
   views only; there is no Torch numeric computation or reference import.
-- NPU compile, device correctness, native CUDA regression and device benchmark
-  remain unverified. macOS ARM has no compatible `triton-ascend` distribution
-  in the tested package index, CANN toolchain, or configured Linux runtime.
+- At the end of this local pass, NPU compilation and device checks were still
+  pending. macOS ARM had no compatible `triton-ascend` distribution in the
+  tested package index, CANN toolchain, or configured Linux runtime.
 
 CPU oracle checks can be reproduced without importing the accelerator package:
 
@@ -79,7 +79,40 @@ python -m pytest --noconftest -q \
   tests/test_fused_deepseek_v4_kv_rope_insert_reference.py
 ```
 
-## Server validation
+## Ascend 910B4 server checks (2026-11-11)
+
+Validated with Ascend 910B4-1 (40 vector cores), driver 25.2.0, CANN 9.0.0,
+Python 3.11.15, Torch 2.9.0+cpu, torch_npu 2.9.0.post2, FlagTree
+0.7.0+ascend3.5 (Triton module 3.5.1), FlagGems 5.0.2, and cann-shmem 1.6.0.
+Torch/NPU and CANN came from the existing container image; project dependencies
+were installed in a separate venv. Only one physical NPU was selected.
+
+- Public package dispatch selected the Ascend override, and a minimal Torch NPU
+  tensor operation passed.
+- Real Triton compilation passed 16/16 cases: four cache formats, S=32/64,
+  and M=1/83. M=83 exercises the core-bound token loop with 40 vector cores.
+  Compiled artifacts include `npubin`, `ttir`, `ttadapter`, `bcmlir`, and
+  `mlirbc`; these are device compiler results, not Python bytecode checks.
+- All 40 operator `--quick` cases passed (80.58 s). They retain byte-exact
+  cache comparison, KV immutability, padded pages, negative slots, empty
+  inserts, noncontiguous token strides, API selection, and invalid metadata.
+- All 19 CPU oracle checks also passed on the server (9.16 s).
+
+Device validation exposed two issues in the independent Torch reference.
+NPU `exp2(-3)` returned `0.1249999925494194`, which changes exact E4M3 tie
+rounding; integral powers are now constructed exactly and normalization uses
+the reciprocal lattice spacing. NPU `signbit(-0.0)` also lost the sign, so the
+reference reads the IEEE sign bit directly. A device regression checks all
+finite positive FP8 lattice points, midpoints and adjacent FP32 values, plus
+their negative counterparts, against CPU-native E4M3 conversion. The production
+Triton kernels and byte comparison requirements were unchanged.
+
+These checks establish compilation and the tested functional cases on this
+910B4 stack. Full non-quick shapes, native CUDA cross-checks, 910C, non-finite
+grouped quantization, microbenchmarks and model end-to-end performance remain
+unverified. No speedup or performance acceptance result is claimed.
+
+## Server validation commands
 
 Use an existing compatible CANN / torch_npu / Triton Ascend or FlagTree
 environment. Preserve its dependency versions; the editable install below
