@@ -52,6 +52,15 @@ def native(device=None):
     return op if callable(op) else None
 
 
+def _integer_power_of_two(exponent):
+    """Exact normal FP32 powers for the finite FP8 quantization exponent range.
+
+    NPU exp2 can differ by one ULP even for integral exponents. That shifts
+    exact E4M3 midpoints, so construct the IEEE exponent instead of using exp2.
+    """
+    return ((exponent.to(torch.int32) + 127) << 23).view(torch.float32)
+
+
 def encode_e4m3(values):
     """Independent arithmetic E4M3 encoder; no device FP8 cast is needed.
 
@@ -61,8 +70,8 @@ def encode_e4m3(values):
     values = values.float()
     magnitude = values.abs().clamp(max=448.0)
     exponent = torch.floor(torch.log2(magnitude.clamp_min(2.0**-6)))
-    step = torch.exp2(exponent - 3)
-    rounded = torch.round(magnitude / step).to(torch.int32)
+    inverse_step = _integer_power_of_two(3 - exponent)
+    rounded = torch.round(magnitude * inverse_step).to(torch.int32)
     normal = (exponent.to(torch.int32) + 7) * 8 + rounded - 8
     encoded = torch.where(magnitude >= 2.0**-6, normal, rounded)
     encoded = torch.where(torch.isnan(values), 0x7F, encoded)
@@ -74,7 +83,7 @@ def _quantize_reference(values, group_size):
     groups = values.reshape(values.shape[0], -1, group_size)
     absmax = groups.abs().amax(dim=-1).clamp_min(1e-4)
     exponent = torch.ceil(torch.log2(absmax / 448.0))
-    normalized = groups * torch.exp2(-exponent).unsqueeze(-1)
+    normalized = groups * _integer_power_of_two(-exponent).unsqueeze(-1)
     return encode_e4m3(normalized).reshape(values.shape), (exponent + 127).to(
         torch.uint8
     )

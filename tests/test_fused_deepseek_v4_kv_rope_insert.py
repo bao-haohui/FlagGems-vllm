@@ -19,6 +19,7 @@ import flaggems_vllm
 from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     build_inputs,
+    encode_e4m3,
     native,
     torch_reference,
 )
@@ -306,3 +307,18 @@ def test_invalid_metadata_is_rejected(invalid):
         inputs["fp8_scale"] = None
     with pytest.raises(RuntimeError):
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+def test_reference_encoder_matches_cpu_at_fp8_midpoints():
+    # CPU-native FP8 is independent of both software encoders. In particular,
+    # 1.0625 / 0.125 must remain exactly 8.5 and round to the even lattice point.
+    lattice = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = (lattice[:-1] + lattice[1:]) * 0.5
+    below = torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf")))
+    above = torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))
+    positive = torch.cat((lattice, midpoints, below, above))
+    values = torch.cat((positive, -positive))
+    expected = values.to(torch.float8_e4m3fn).view(torch.uint8)
+    actual = encode_e4m3(values.to(flaggems_vllm.device)).cpu()
+    assert torch.equal(actual, expected)
