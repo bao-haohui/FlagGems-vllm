@@ -531,7 +531,7 @@ ops:
       Triton implementation matching the native vLLM CUDA semantics.
       Supports BF16, per-tensor FP8, packed V4 and MXFP8 cache interfaces.
       Ascend backend uses software E4M3 encoding and a core-bound launch.
-      MetaX backend tunes multi-token tiles and uses native E4M3 conversion.
+      MetaX backend tunes multi-token tiles and uses Triton E4M3 conversion.
     for:
       - torch.ops._C.fused_deepseek_v4_kv_rope_insert
     labels:

@@ -4,8 +4,12 @@
 
 2026-11-15，分支 `codex/metax-fused-deepseek-v4-kv-rope-insert`，从现有
 `b232a69fc6c0b4ff3d4f7151c0d8cb171ec79ef7` 派生，保留已有 NVIDIA/Ascend 实现。
-MetaX 初版、后端导出、tuning 配置、功能测试和原生 benchmark 接入已完成。
-设备编译、精度和性能结果待本轮 MC550 验证后补充，当前不宣称性能达标。
+MetaX 实现、后端导出、tuning 配置、功能测试和原生 benchmark 接入已完成。
+MC550 真实编译与设备功能 108/108、CPU 参考 24/24、三方对拍 34/34 通过；
+40 组同栈 CUDA Graph 性能全部达标。模型端到端及其他 MetaX 设备尚未验证。
+
+实测生产代码为 `11dd7b7`，kernel 文件 SHA256：
+`7edec4bc18dc598115bd60eb4f0465c936a1f8bfad4982a4811fd4b59a8591a2`。
 
 参考 [PR #1083](https://github.com/flagos-ai/FlagGems-vllm/pull/1083) 的融合数据流
 和 [PR #849](https://github.com/flagos-ai/FlagGems-vllm/pull/849) 的厂商后端覆盖方式。
@@ -42,11 +46,27 @@ Packed 页内先存整页所有 payload，再存整页所有 scale，不能按�
 
 分组 scale 为 `2**ceil(log2(max(amax,1e-4)/448))`，存储指数加 127 的 UE8M0。
 保留 E4M3FN 的 RNE、饱和、负零及两种 FP8 路径不同的 BF16 舍入位置。
-RoPE 偶数分量使用两个乘法后相减，奇数分量显式 `tl.fma`；launch 禁用隐式浮点融合，
-避免编译器任意改变已约定的舍入点。最终必须以同栈原生逐字节对拍确认。
+RoPE 两个分量都显式融合 cos 乘积：
 
-有效 slot 必须唯一且在缓存范围内，有效 position 必须在表内。负 slot 跳过全部读取和
-写入；相应 position 可无效，全负 slot 时位置表可为空。M=0 直接返回。
+```text
+even_out = fma(even, cos, -round_fp32(odd*sin))
+odd_out  = fma(odd,  cos,  round_fp32(even*sin))
+```
+
+8 个能区分融合顺序的定向输入在原生 BF16、V4 packed 和 per-tensor FP8 上确认了
+偶数分量的融合顺序；奇数分量另有独立反例。MXFP8 与 V4 使用相同的原生旋转代码。
+MetaX 奇数分量与 NV 初版融合 `even*sin` 的顺序不同。反例 `even=-0.5, odd=2.015625,
+cos=0.5443320274353027, sin=0.8388698697090149` 在两种顺序下分别舍入为
+BF16 的 `0.67578125` 与 `0.6796875`。MetaX 独立 Torch reference 使用
+`_rope_fma_on_cos=True`；其余平台保持原有默认值。
+量化路径另外显式保留缩放前的符号位，保证精确负零与舍入到零的负数均存为负 FP8 零。
+当前 FlagTree/MetaX 工具链的向量乘法、浮点取负可能将零规范成正零；已观察到
+16 元素乘法探针保留负零，而 512 元素探针丢失符号。RoPE 的正弦乘积使用带乘积
+符号零的 FMA 表达等价乘法，取负使用 IEEE 符号位 XOR；避免依赖易变的隐式融合。
+
+有效 slot 必须唯一且在缓存范围内，有效 position 必须在表内。负 slot 不读取对应
+KV、position 和位置表，也不写缓存；相应 position 可无效，全负 slot 时位置表可为空。
+M=0 直接返回。
 不读取 M 之后的 DP padding 行。输入与缓存应互不别名；重复有效 slot 不保证确定性。
 
 本阶段面向模型的有限输入、有限 RoPE 结果和正有限 FP8 scale；非有限中间结果、
@@ -89,6 +109,11 @@ MetaX 的线程宽度不同，warp 数通过设备测试选择，不直接认定
 | 8 | 4 | 1 |
 | 16 | 4 | 1 |
 
+FlagTree AABS 还会按实际 M 调整配置；本轮小 M 实测最优配置额外出现
+`BLOCK_TOKENS=1/2, num_warps=4`。6 个基础配置和这 2 个实测派生配置均单独核查：
+8 配置 × 四格式的随机/尾块 32 项通过，8 配置 × 四格式 × 四相位的零值 128 项通过。
+配置记录应同时保存 YAML 候选和运行时实际选择，不能只从 YAML 推断发射参数。
+
 Key 为实际插入行数 M、缓存格式、页大小、page stride、token stride，另外遵循
 libtuner 的 dtype key。候选使用相同数学路径，通过 CUDA Graph 计时选择。
 首次编译和调优必须放在正式性能计时/图捕获之前；有效 slot 唯一且重复写入幂等，
@@ -125,6 +150,10 @@ Torch reference 仍可用于精度核查。基线/库注册仅存在于 baseline
 正式比较要求两者使用同一设备、Torch、MACA 和计时模式。已建立的旧开发环境
 Torch2.8/MACA3.7 与原生基线 Torch2.10/MACA3.9 不能直接比较；本轮以独立 venv
 在原生 Torch2.10/MACA3.9 容器内安装指定 FlagTree，保留两套旧环境。
+实际统一栈：`Torch 2.10.0+metax3.9.0.8`、MACA3.9、
+`FlagTree 0.7.0.post2+metax3.6`（导入的 Triton 模块3.6.0）、FlagGems5.4.0。
+厂商原生库 SHA256 始终为
+`95fb06a4eb94be7db4cb1821d095c191e3e924697a319468c06c66046768fe71`。
 
 原生 kernel 在检查负 slot 前读取位置表，因此“跳过行 position 无效/表为空”的扩展
 安全测试使用独立 reference，或将原生安全输入适配成本计入完整接口计时。
@@ -144,20 +173,43 @@ S=32、M=1/2/4/8/64/100/1024/2048/8192/16384，1024 行用例有 N=1027 的 DP p
 
 | 检查 | 本轮结果 |
 |---|---|
-| 独立 CPU reference 与显式原生入口选择 | 22 项通过 |
+| 独立 CPU reference、显式原生入口选择与两种 FMA 定向例 | 24 项通过 |
 | scale 指数改写的 CPU 数学核查 | 32,640 种非负有限 BF16 位模式全部一致 |
-| Python 语法、Black/isort/flake8 | 通过；最终提交前复核 |
+| Python 语法及本次9个文件的全部 pre-commit hooks | 通过 |
 | Python wheel 构建 | 通过；不是设备 kernel 编译 |
-| MC550 四路径编译/精度 | 待运行 |
-| 同栈原生性能与 best config | 待运行 |
+| MC550 四路径编译/精度 | 108/108 通过 |
+| 原生/Triton/独立 CPU 三方对拍 | 34/34 通过，含完整 backing、页 padding、KV 不变 |
+| 基础与实测 AABS 配置随机尾块核查 | 32/32 通过 |
+| 配置级旋转零值回归 | 4 格式 × 4 相位 × 8 配置，128/128 通过 |
+| 设备 profiler | BF16 2048行，5次原生、5次SUT各捕获5个目标kernel，一次API一次launch |
+| 同栈原生性能与 best config | 40/40 达标，详见下表 |
+| 仓库 benchmark 入口 smoke | 4个格式测试、40条core记录通过；原生标签正确 |
 | 模型端到端 | 未运行 |
 
 本地 CPU 为 macOS ARM，CPU reference 测试和 wheel 构建不能替代 MetaX JIT 验证。
 
 | Trial | 假设/改变 | 验证 | 性能/决定 |
 |---|---|---|---|
-| 0 | NV 固定单 token 作为同栈起点 | 待 MC550 运行 | 未计时 |
-| 1 | MetaX 多 token tile 与指数位 scale | CPU 数学核查通过；设备待验证 | 待原生对拍及计时 |
+| 初版 | NV融合数据流、多token tile、指数位scale | 初轮54/59通过，发现FMA和零符号差异 | 精度未过，不计时 |
+| 精度收敛 | 两cos FMA、乘积符号零、位运算取负和量化前符号保留 | 108项功能、34组三方、32配置随机、128配置零值全部通过 | keep |
+| 配置选择 | 六组基础候选及AABS实测派生配置 | 所有40条性能输入先与原生字节比较 | 全部达标，keep |
+
+计时使用 `triton.testing.do_bench_cudagraph`，每轮30ms、三轮取中位数，交替测量顺序。
+原生和 SUT 置于同一进程、同一 Torch/MACA 栈；JIT、autotune、输入构造和库加载在计时外。
+下面的几何平均对每格式10个M等权，最小值单独报告；全部 shape 的原生/SUT 延迟和
+实际 best config 已保存。本表中的大M延迟为 M=N=16384，单位 μs。
+
+| 格式 | 几何平均加速比 | 最小加速比 | 大M原生 μs | 大M Triton μs |
+|---|---|---|---|---|
+| BF16 | 1.410× | 1.169× | 35.154 | 30.066 |
+| per-tensor FP8 | 2.053× | 1.283× | 61.925 | 48.257 |
+| V4 packed | 2.766× | 2.244× | 123.039 | 54.343 |
+| MXFP8 | 2.586× | 1.994× | 117.958 | 59.170 |
+
+固定单token/一warp发射对照中，per-tensor FP8 在 M=16384 为54.715μs，
+当前选择为48.257μs；其余格式的配置收益按具体shape判断，完整结果保留原始采样。
+没有 shape 低于0.9，未触发 deep optimization；后续应以模型实际shape分布和端到端结果
+决定进一步优化目标。这里不将 CUDA Graph 算子加速比推算为模型加速比。
 
 若关键 shape 加速比低于 0.9，先核对原生入口、调度、autotune 和计时方式，
 再结合 profiler 或编译产物、launch 数、配置交叉点证据记录进一步优化；不得跳过精度检查。
