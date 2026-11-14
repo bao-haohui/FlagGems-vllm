@@ -117,6 +117,7 @@ def torch_reference(
     kv_mxfp8=False,
     *,
     _assume_all_valid=False,
+    _rope_fma_on_cos=False,
 ):
     """Complete unfused reference, preserving input KV and physical cache gaps.
 
@@ -141,7 +142,15 @@ def torch_reference(
     pairs = values[:, 448:].reshape(-1, 32, 2)
     rotated = values.clone()
     rotated[:, 448::2] = pairs[:, :, 0] * cosine - pairs[:, :, 1] * sine
-    rotated[:, 449::2] = torch.addcmul(pairs[:, :, 1] * cosine, pairs[:, :, 0], sine)
+    if _rope_fma_on_cos:
+        # The official MACA compiler contracts odd*cos instead of even*sin.
+        rotated[:, 449::2] = torch.addcmul(
+            pairs[:, :, 0] * sine, pairs[:, :, 1], cosine
+        )
+    else:
+        rotated[:, 449::2] = torch.addcmul(
+            pairs[:, :, 1] * cosine, pairs[:, :, 0], sine
+        )
     block = slots // cache_block_size
     offset = slots % cache_block_size
 

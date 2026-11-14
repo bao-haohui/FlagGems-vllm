@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _fp8_bytes(values):
+    # The packed MetaX conversion can canonicalize an exact negative zero.
+    # Preserve the FP32 sign explicitly, including values rounding to FP8 zero.
+    sign = (values.to(tl.int32, bitcast=True) >> 24) & 0x80
+    encoded = tl.clamp(values, -448.0, 448.0).to(tl.float8e4nv)
+    bits = encoded.to(tl.uint8, bitcast=True)
+    return ((bits & 0x7F) | sign).to(tl.uint8)
+
+
+@triton.jit
 def _quantize_ue8m0(values, BLOCK_TOKENS: tl.constexpr, GROUP_SIZE: tl.constexpr):
     groups: tl.constexpr = 512 // GROUP_SIZE
     tiles = tl.reshape(values, (BLOCK_TOKENS, groups, GROUP_SIZE))
@@ -40,7 +50,7 @@ def _quantize_ue8m0(values, BLOCK_TOKENS: tl.constexpr, GROUP_SIZE: tl.constexpr
     code = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     inverse = ((254 - code) << 23).to(tl.float32, bitcast=True)
     scaled = tiles * inverse[:, :, None]
-    quantized = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
+    quantized = _fp8_bytes(scaled)
     return tl.reshape(quantized, (BLOCK_TOKENS, 512)), code.to(tl.uint8)
 
 
@@ -95,10 +105,11 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
         tl.float32
     )
     even, odd = tl.split(tl.reshape(rope, (BLOCK_TOKENS, 32, 2)))
-    # Keep the same rounding points as PR #1083 and the native reference.
-    # Disable implicit fusion at launch; only the odd component is an FMA.
+    # The official MACA build contracts the odd*cos term, which differs from
+    # PR #1083's even*sin FMA at BF16 rounding boundaries. Keep this order
+    # explicit and disable implicit fusion for the other operations.
     rotated_rope = tl.reshape(
-        tl.join(even * cosine - odd * sine, tl.fma(even, sine, odd * cosine)),
+        tl.join(even * cosine - odd * sine, tl.fma(odd, cosine, even * sine)),
         (BLOCK_TOKENS, 64),
     )
 
@@ -112,7 +123,7 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
         token = page + offsets[:, None] * 576
         tl.store(
             token + dims[None, :],
-            payload.to(tl.uint8, bitcast=True),
+            payload,
             live[:, None] & (dims[None, :] < 448),
         )
         rope_dst = (token + 448).to(tl.pointer_type(tl.bfloat16))
@@ -145,14 +156,14 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
             # Per-tensor FP8 quantizes FP32 RoPE directly: no BF16 round trip.
             scaled = rotated * (1.0 / tl.load(fp8_scale))
             tl.store(
-                dst, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv), live[:, None]
+                dst.to(tl.pointer_type(tl.uint8)), _fp8_bytes(scaled), live[:, None]
             )
         else:
             # MXFP8, unlike per-tensor FP8, rounds RoPE to BF16 first.
             rounded = rotated.to(tl.bfloat16).to(tl.float32)
             payload, codes = _quantize_ue8m0(rounded, BLOCK_TOKENS, 32)
             dst = page + offsets[:, None] * 512 + dims[None, :]
-            tl.store(dst, payload.to(tl.uint8, bitcast=True), live[:, None])
+            tl.store(dst, payload, live[:, None])
             scale_dims = tl.arange(0, 16)
             scale = page + CACHE_BLOCK_SIZE * 512 + offsets[:, None] * 16
             tl.store(scale + scale_dims[None, :], codes, live[:, None])

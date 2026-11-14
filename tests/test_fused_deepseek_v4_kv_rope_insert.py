@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import pytest
 import torch
 
@@ -28,7 +30,10 @@ from flaggems_vllm import testing as utils
 from . import conftest as cfg
 
 VLLM_REF = native(flaggems_vllm.device)
-REFERENCE = VLLM_REF or torch_reference
+TORCH_REF = functools.partial(
+    torch_reference, _rope_fma_on_cos=flaggems_vllm.vendor_name == "metax"
+)
+REFERENCE = VLLM_REF or TORCH_REF
 
 # Functional coverage retains DP padding and upstream's 256-token page cases.
 TEST_SHAPES = [
@@ -311,7 +316,7 @@ def test_skipped_positions_are_not_read(cache_format, all_skipped):
     expected = inputs["k_cache"].clone()
     # The raw native baseline reads positions before checking negative slots.
     # Use the independent reference for this additional input-safety contract.
-    torch_reference(**dict(inputs, k_cache=expected))
+    TORCH_REF(**dict(inputs, k_cache=expected))
     before = inputs["kv"].clone()
     flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
     _assert_bytes_equal(inputs["k_cache"], expected)
@@ -347,7 +352,7 @@ def test_fp8_rounding_and_scale_boundaries(cache_format):
         key: value.cpu() if isinstance(value, torch.Tensor) else value
         for key, value in inputs.items()
     }
-    torch_reference(**cpu_inputs)
+    TORCH_REF(**cpu_inputs)
     if VLLM_REF is not None:
         native_cache = inputs["k_cache"].clone()
         VLLM_REF(**dict(inputs, k_cache=native_cache))
@@ -401,9 +406,36 @@ def test_per_tensor_fp8_does_not_round_rope_through_bf16():
         key: value.cpu() if isinstance(value, torch.Tensor) else value
         for key, value in inputs.items()
     }
-    torch_reference(**cpu_inputs)
+    TORCH_REF(**cpu_inputs)
     expected = cpu_inputs["k_cache"]
     assert expected[0, 0, 448].float().item() == 0.5625
+    if VLLM_REF is not None:
+        native_cache = inputs["k_cache"].clone()
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+        _assert_bytes_equal(native_cache.cpu(), expected)
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"].cpu(), expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+def test_metax_native_rope_fma_order(cache_format):
+    if flaggems_vllm.vendor_name != "metax":
+        pytest.skip("MACA native FMA contraction order")
+    inputs = _make_inputs(1, 1, 32, cache_format, scale_value=1.0)
+    inputs["kv"].zero_()
+    inputs["kv"][:, 448::2] = -0.5
+    inputs["kv"][:, 449::2] = 2.015625
+    inputs["cos_sin_cache"][:, :32].fill_(0.5443320274353027)
+    inputs["cos_sin_cache"][:, 32:].fill_(0.8388698697090149)
+    cpu_inputs = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    TORCH_REF(**cpu_inputs)
+    expected = cpu_inputs["k_cache"]
+    if cache_format == "bf16":
+        assert expected[0, 0, 449].float().item() == 0.67578125
     if VLLM_REF is not None:
         native_cache = inputs["k_cache"].clone()
         VLLM_REF(**dict(inputs, k_cache=native_cache))
