@@ -119,9 +119,14 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
     # The official MACA build contracts the cos product in both components.
     # Express both FMAs explicitly: implicit contraction is compiler-dependent,
     # and PR #1083's odd-component even*sin FMA differs at rounding boundaries.
+    odd_sine = _multiply_preserve_zero(odd, sine)
+    # Vector floating negation can also canonicalize zero; flip the IEEE sign.
+    negative_odd_sine = (odd_sine.to(tl.int32, bitcast=True) ^ -2147483648).to(
+        tl.float32, bitcast=True
+    )
     rotated_rope = tl.reshape(
         tl.join(
-            tl.fma(even, cosine, -_multiply_preserve_zero(odd, sine)),
+            tl.fma(even, cosine, negative_odd_sine),
             tl.fma(odd, cosine, _multiply_preserve_zero(even, sine)),
         ),
         (BLOCK_TOKENS, 64),
