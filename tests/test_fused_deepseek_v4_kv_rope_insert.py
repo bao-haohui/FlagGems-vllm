@@ -445,6 +445,39 @@ def test_metax_native_rope_fma_order(cache_format):
 
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+@pytest.mark.parametrize(
+    "cosine,sine", [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
+)
+def test_metax_rope_signed_zeros(cache_format, cosine, sine):
+    if flaggems_vllm.vendor_name != "metax":
+        pytest.skip("MetaX vector multiplication signed-zero regression")
+    slots = torch.arange(17, device=flaggems_vllm.device)
+    inputs = _make_inputs(20, 17, 32, cache_format, scale_value=1.0, slot_mapping=slots)
+    values = (
+        torch.tensor([-0.0, 0.0], dtype=torch.bfloat16).repeat(20 * 256).view(20, 512)
+    )
+    values[:, 448:] = torch.tensor(
+        [-0.0, 1.0, 0.0, -1.0, -1.0, -0.0, 1.0, 0.0], dtype=torch.bfloat16
+    ).repeat(8)
+    inputs["kv"] = values.to(flaggems_vllm.device)
+    inputs["cos_sin_cache"][:, :32].fill_(cosine)
+    inputs["cos_sin_cache"][:, 32:].fill_(sine)
+    cpu_inputs = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    TORCH_REF(**cpu_inputs)
+    expected = cpu_inputs["k_cache"]
+    if VLLM_REF is not None:
+        native_cache = inputs["k_cache"].clone()
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+        _assert_bytes_equal(native_cache.cpu(), expected)
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"].cpu(), expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("invalid", ["token_stride", "page_stride", "alignment"])
 def test_metax_rejects_unsupported_packed_layout(invalid):
     if flaggems_vllm.vendor_name != "metax":

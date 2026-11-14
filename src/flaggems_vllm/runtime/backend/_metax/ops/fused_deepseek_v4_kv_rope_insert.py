@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _multiply_preserve_zero(left, right):
+    # Vector FMUL can discard -0 on this backend. FMA with a zero carrying
+    # the product's sign has exactly FMUL's finite-input rounding and zero
+    # sign, while retaining an explicit third operand in the generated code.
+    sign = (left.to(tl.int32, bitcast=True) ^ right.to(tl.int32, bitcast=True)) & (
+        -2147483648
+    )
+    return tl.fma(left, right, sign.to(tl.float32, bitcast=True))
+
+
+@triton.jit
 def _fp8_bytes(values, unscaled):
     # Preserve the sign before scaling: the MetaX multiply can canonicalize
     # an exact negative zero. All supported quantization scales are positive.
@@ -109,7 +120,10 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
     # PR #1083's even*sin FMA at BF16 rounding boundaries. Keep this order
     # explicit and disable implicit fusion for the other operations.
     rotated_rope = tl.reshape(
-        tl.join(even * cosine - odd * sine, tl.fma(odd, cosine, even * sine)),
+        tl.join(
+            _multiply_preserve_zero(even, cosine) - _multiply_preserve_zero(odd, sine),
+            tl.fma(odd, cosine, _multiply_preserve_zero(even, sine)),
+        ),
         (BLOCK_TOKENS, 64),
     )
 
