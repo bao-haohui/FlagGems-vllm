@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_deepseek_v4_kv_rope_insert:
+  - META: {BLOCK_TOKENS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_TOKENS: 2}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_TOKENS: 4}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_TOKENS: 4}
+    num_warps: 2
+    num_stages: 1
+  - META: {BLOCK_TOKENS: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_TOKENS: 16}
+    num_warps: 4
+    num_stages: 1
+
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 64

@@ -61,8 +61,14 @@ class FusedDeepseekV4KVRopeInsertBenchmark(base.Benchmark):
 
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 def test_fused_deepseek_v4_kv_rope_insert(cache_format):
+    if flaggems_vllm.vendor_name == "metax" and VLLM_REF is None:
+        pytest.skip(
+            "MetaX performance comparison requires the official native baseline; "
+            "set KV_ROPE_NATIVE_LIBRARY and KV_ROPE_NATIVE_NAMESPACE"
+        )
     bench = FusedDeepseekV4KVRopeInsertBenchmark(cache_format)
-    print("baseline:", "vLLM native CUDA" if VLLM_REF else "Torch unfused reference")
+    label = f"vLLM native ({flaggems_vllm.vendor_name})"
+    print("baseline:", label if VLLM_REF else "Torch unfused reference")
     if VLLM_REF is None:
         bench.run()
     else:
@@ -70,7 +76,7 @@ def test_fused_deepseek_v4_kv_rope_insert(cache_format):
 
         def native_label(result):
             return original_str(result).replace(
-                "Torch Latency (ms)", "vLLM CUDA Latency (ms)"
+                "Torch Latency (ms)", f"{label} Latency (ms)"
             )
 
         base.BenchmarkResult.__str__ = native_label

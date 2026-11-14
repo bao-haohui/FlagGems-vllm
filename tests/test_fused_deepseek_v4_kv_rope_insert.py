@@ -285,12 +285,154 @@ def test_noncontiguous_token_stride(cache_format):
 
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
-def test_public_api_selects_ascend_override():
-    if flaggems_vllm.vendor_name != "ascend":
-        pytest.skip("Ascend backend dispatch check")
-    assert "._ascend.ops." in (
+def test_public_api_selects_backend_override():
+    vendor = flaggems_vllm.vendor_name
+    if vendor not in ("ascend", "metax"):
+        pytest.skip("Ascend/MetaX backend dispatch check")
+    assert f"._{vendor}.ops." in (
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert.__module__
     )
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+@pytest.mark.parametrize("all_skipped", [False, True])
+def test_skipped_positions_are_not_read(cache_format, all_skipped):
+    if flaggems_vllm.vendor_name not in ("ascend", "metax"):
+        pytest.skip("Backend extensions allow invalid positions on skipped rows")
+    slots = torch.tensor([3, -7, 1, -99, 8], device=flaggems_vllm.device)
+    if all_skipped:
+        slots.fill_(-7)
+    inputs = _make_inputs(8, 5, 32, cache_format, slot_mapping=slots)
+    inputs["position_ids"][:5][slots < 0] = 2**40
+    inputs["position_ids"][5:] = 2**40
+    if all_skipped:
+        inputs["cos_sin_cache"] = inputs["cos_sin_cache"][:0]
+    expected = inputs["k_cache"].clone()
+    # The raw native baseline reads positions before checking negative slots.
+    # Use the independent reference for this additional input-safety contract.
+    torch_reference(**dict(inputs, k_cache=expected))
+    before = inputs["kv"].clone()
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"], expected)
+    _assert_bytes_equal(inputs["kv"], before)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", ["fp8", "packed_v4", "mxfp8"])
+def test_fp8_rounding_and_scale_boundaries(cache_format):
+    # BF16 neighbors of every E4M3 midpoint, signed zero, saturation, tiny
+    # groups and maxima exactly at/on either side of UE8M0 power boundaries.
+    lattice = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = ((lattice[:-1] + lattice[1:]) * 0.5).bfloat16()
+    below = torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf")))
+    above = torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))
+    positive = torch.cat((lattice.bfloat16(), midpoints, below, above))
+    pattern = torch.cat((positive, -positive))
+    inputs = _make_inputs(20, 17, 32, cache_format, scale_value=1.0)
+    values = pattern.repeat((20 * 512 + pattern.numel() - 1) // pattern.numel())
+    values = values[: 20 * 512].reshape(20, 512)
+    # Set entire rows to known extrema so each scale group exercises the edge.
+    values[0].zero_()
+    values[1].fill_(2**-20)
+    values[2].fill_(448.0)
+    values[3].fill_(446.0)
+    values[4].fill_(450.0)
+    values[5].fill_(-448.0)
+    values[6].fill_(57344.0)
+    inputs["kv"] = values.to(flaggems_vllm.device)
+    inputs["cos_sin_cache"][:, :32].fill_(1)
+    inputs["cos_sin_cache"][:, 32:].zero_()
+    cpu_inputs = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    torch_reference(**cpu_inputs)
+    if VLLM_REF is not None:
+        native_cache = inputs["k_cache"].clone()
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+        _assert_bytes_equal(native_cache.cpu(), cpu_inputs["k_cache"])
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"].cpu(), cpu_inputs["k_cache"])
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+def test_nonzero_cache_storage_offset(cache_format):
+    inputs = _make_inputs(20, 17, 32, cache_format)
+    cache = inputs["k_cache"]
+    # Keep a prefix and suffix around the physical cache, both checked below.
+    prefix_bytes = 32
+    byte_count = cache.numel() * cache.element_size()
+    storage = torch.full(
+        (byte_count + prefix_bytes * 2,),
+        0xA5,
+        dtype=torch.uint8,
+        device=cache.device,
+    )
+    expected = storage.clone()
+    inputs["k_cache"] = (
+        storage[prefix_bytes : prefix_bytes + byte_count]
+        .view(cache.dtype)
+        .view(cache.shape)
+    )
+    expected_cache = (
+        expected[prefix_bytes : prefix_bytes + byte_count]
+        .view(cache.dtype)
+        .view(cache.shape)
+    )
+    REFERENCE(**dict(inputs, k_cache=expected_cache))
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(storage, expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+def test_per_tensor_fp8_does_not_round_rope_through_bf16():
+    inputs = _make_inputs(1, 1, 32, "fp8", scale_value=1.0)
+    inputs["kv"].zero_()
+    inputs["kv"][:, 448::2] = 1
+    # The even component lies just above the FP8 midpoint 0.53125. An
+    # incorrect BF16 intermediate rounds it back onto that midpoint, changing
+    # the final E4M3 byte from 0.5625 to 0.5.
+    cosine = 0.5315
+    inputs["cos_sin_cache"][:, :32].fill_(cosine)
+    inputs["cos_sin_cache"][:, 32:].fill_((1.0 - cosine * cosine) ** 0.5)
+    cpu_inputs = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    torch_reference(**cpu_inputs)
+    expected = cpu_inputs["k_cache"]
+    assert expected[0, 0, 448].float().item() == 0.5625
+    if VLLM_REF is not None:
+        native_cache = inputs["k_cache"].clone()
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+        _assert_bytes_equal(native_cache.cpu(), expected)
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"].cpu(), expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("invalid", ["token_stride", "page_stride", "alignment"])
+def test_metax_rejects_unsupported_packed_layout(invalid):
+    if flaggems_vllm.vendor_name != "metax":
+        pytest.skip("MetaX packed-layout validation")
+    inputs = _make_inputs(4, 4, 32, "packed_v4")
+    shape = inputs["k_cache"].shape
+    page = shape[1] * shape[2]
+    backing = torch.empty(
+        page * (shape[0] + 1) + 128, device=flaggems_vllm.device, dtype=torch.uint8
+    )
+    strides = (page, shape[2], 1)
+    if invalid == "token_stride":
+        strides = (page + 64, shape[2] + 1, 1)
+    elif invalid == "page_stride":
+        strides = (page - 2, shape[2], 1)
+    else:
+        strides = (page + 1, shape[2], 1)
+    inputs["k_cache"] = backing.as_strided(shape, strides)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
 
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert

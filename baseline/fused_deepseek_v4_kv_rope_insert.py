@@ -15,6 +15,7 @@
 """Native collection contract and independent Torch reference; never production."""
 
 import importlib
+import os
 
 import torch
 
@@ -44,6 +45,20 @@ BENCHMARK_SHAPES = [
 def native(device=None):
     if device is not None and torch.device(device).type != "cuda":
         return None
+    # A vendor build can expose the unchanged official entrypoint through an
+    # isolated namespace. Explicit selection must fail loudly if unusable;
+    # never replace a requested native baseline with the Torch reference.
+    library = os.environ.get("KV_ROPE_NATIVE_LIBRARY")
+    namespace = os.environ.get("KV_ROPE_NATIVE_NAMESPACE")
+    if library or namespace:
+        if library:
+            torch.ops.load_library(library)
+        op = getattr(getattr(torch.ops, namespace or "_C"), OP_NAME, None)
+        if not callable(op):
+            raise RuntimeError(
+                f"Native baseline {namespace or '_C'}::{OP_NAME} missing"
+            )
+        return op
     try:
         importlib.import_module("vllm._custom_ops")
     except (ImportError, AttributeError, RuntimeError, OSError):

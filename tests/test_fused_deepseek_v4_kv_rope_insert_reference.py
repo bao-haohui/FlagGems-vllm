@@ -23,10 +23,41 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     build_inputs,
     encode_e4m3,
+    native,
     torch_reference,
 )
 
 pytestmark = pytest.mark.fused_deepseek_v4_kv_rope_insert
+
+
+def test_explicit_native_namespace_is_selected(monkeypatch):
+    def entrypoint(*args):
+        return None
+
+    class NativeNamespace:
+        fused_deepseek_v4_kv_rope_insert = staticmethod(entrypoint)
+
+    loaded = []
+    monkeypatch.setenv("KV_ROPE_NATIVE_LIBRARY", "/explicit/native.so")
+    monkeypatch.setenv("KV_ROPE_NATIVE_NAMESPACE", "_kv_rope_reference_test")
+    monkeypatch.setattr(torch.ops, "load_library", loaded.append)
+    monkeypatch.setattr(torch.ops, "_kv_rope_reference_test", NativeNamespace())
+    assert native("cuda") is entrypoint
+    assert loaded == ["/explicit/native.so"]
+
+
+def test_missing_explicit_native_does_not_fall_back(monkeypatch):
+    monkeypatch.delenv("KV_ROPE_NATIVE_LIBRARY", raising=False)
+    monkeypatch.setenv("KV_ROPE_NATIVE_NAMESPACE", "_kv_rope_missing_test")
+    with pytest.raises(RuntimeError, match="Native baseline .* missing"):
+        native("cuda")
+
+
+def test_explicit_native_library_errors_are_not_suppressed(monkeypatch):
+    monkeypatch.setenv("KV_ROPE_NATIVE_LIBRARY", "/missing/kv_rope/native.so")
+    monkeypatch.delenv("KV_ROPE_NATIVE_NAMESPACE", raising=False)
+    with pytest.raises(OSError):
+        native("cuda")
 
 
 def test_encoder_all_finite_bf16_values():
