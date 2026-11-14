@@ -141,13 +141,16 @@ def torch_reference(
     cosine, sine = angles[:, :32], angles[:, 32:]
     pairs = values[:, 448:].reshape(-1, 32, 2)
     rotated = values.clone()
-    rotated[:, 448::2] = pairs[:, :, 0] * cosine - pairs[:, :, 1] * sine
     if _rope_fma_on_cos:
-        # The official MACA compiler contracts odd*cos instead of even*sin.
+        # The official MACA compiler contracts the cosine term in both outputs.
+        rotated[:, 448::2] = torch.addcmul(
+            -(pairs[:, :, 1] * sine), pairs[:, :, 0], cosine
+        )
         rotated[:, 449::2] = torch.addcmul(
             pairs[:, :, 0] * sine, pairs[:, :, 1], cosine
         )
     else:
+        rotated[:, 448::2] = pairs[:, :, 0] * cosine - pairs[:, :, 1] * sine
         rotated[:, 449::2] = torch.addcmul(
             pairs[:, :, 1] * cosine, pairs[:, :, 0], sine
         )

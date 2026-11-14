@@ -419,15 +419,32 @@ def test_per_tensor_fp8_does_not_round_rope_through_bf16():
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
-def test_metax_native_rope_fma_order(cache_format):
+@pytest.mark.parametrize(
+    "even,odd,cosine,sine,dimension,expected_value,scale",
+    [
+        (-0.5, 2.015625, 0.5443320274353027, 0.8388698697090149, 449, 0.67578125, 1.0),
+        (
+            0.671875,
+            -1.359375,
+            0.9095131158828735,
+            -0.4156752824783325,
+            448,
+            0.046142578125,
+            0.04331343248486519,
+        ),
+    ],
+)
+def test_metax_native_rope_fma_order(
+    cache_format, even, odd, cosine, sine, dimension, expected_value, scale
+):
     if flaggems_vllm.vendor_name != "metax":
         pytest.skip("MACA native FMA contraction order")
-    inputs = _make_inputs(1, 1, 32, cache_format, scale_value=1.0)
+    inputs = _make_inputs(1, 1, 32, cache_format, scale_value=scale)
     inputs["kv"].zero_()
-    inputs["kv"][:, 448::2] = -0.5
-    inputs["kv"][:, 449::2] = 2.015625
-    inputs["cos_sin_cache"][:, :32].fill_(0.5443320274353027)
-    inputs["cos_sin_cache"][:, 32:].fill_(0.8388698697090149)
+    inputs["kv"][:, 448::2] = even
+    inputs["kv"][:, 449::2] = odd
+    inputs["cos_sin_cache"][:, :32].fill_(cosine)
+    inputs["cos_sin_cache"][:, 32:].fill_(sine)
     cpu_inputs = {
         key: value.cpu() if isinstance(value, torch.Tensor) else value
         for key, value in inputs.items()
@@ -435,7 +452,7 @@ def test_metax_native_rope_fma_order(cache_format):
     TORCH_REF(**cpu_inputs)
     expected = cpu_inputs["k_cache"]
     if cache_format == "bf16":
-        assert expected[0, 0, 449].float().item() == 0.67578125
+        assert expected[0, 0, dimension].float().item() == expected_value
     if VLLM_REF is not None:
         native_cache = inputs["k_cache"].clone()
         VLLM_REF(**dict(inputs, k_cache=native_cache))

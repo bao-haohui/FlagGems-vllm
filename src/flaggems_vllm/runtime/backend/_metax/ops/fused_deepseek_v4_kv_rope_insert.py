@@ -116,12 +116,12 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
         tl.float32
     )
     even, odd = tl.split(tl.reshape(rope, (BLOCK_TOKENS, 32, 2)))
-    # The official MACA build contracts the odd*cos term, which differs from
-    # PR #1083's even*sin FMA at BF16 rounding boundaries. Keep this order
-    # explicit and disable implicit fusion for the other operations.
+    # The official MACA build contracts the cos product in both components.
+    # Express both FMAs explicitly: implicit contraction is compiler-dependent,
+    # and PR #1083's odd-component even*sin FMA differs at rounding boundaries.
     rotated_rope = tl.reshape(
         tl.join(
-            _multiply_preserve_zero(even, cosine) - _multiply_preserve_zero(odd, sine),
+            tl.fma(even, cosine, -_multiply_preserve_zero(odd, sine)),
             tl.fma(odd, cosine, _multiply_preserve_zero(even, sine)),
         ),
         (BLOCK_TOKENS, 64),

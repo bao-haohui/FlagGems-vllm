@@ -97,19 +97,44 @@ def test_rope_pair_order_and_position_lookup():
     assert torch.equal(kv, before)
 
 
-def test_metax_reference_fma_order_at_bf16_boundary():
+@pytest.mark.parametrize(
+    "even,odd,cosine,sine,dimension,metax_value,default_value",
+    [
+        (
+            -0.5,
+            2.015625,
+            0.5443320274353027,
+            0.8388698697090149,
+            449,
+            0.67578125,
+            0.6796875,
+        ),
+        (
+            0.671875,
+            -1.359375,
+            0.9095131158828735,
+            -0.4156752824783325,
+            448,
+            0.046142578125,
+            0.0458984375,
+        ),
+    ],
+)
+def test_metax_reference_fma_order_at_bf16_boundary(
+    even, odd, cosine, sine, dimension, metax_value, default_value
+):
     kv = torch.zeros(1, 512, dtype=torch.bfloat16)
-    kv[:, 448::2] = -0.5
-    kv[:, 449::2] = 2.015625
+    kv[:, 448::2] = even
+    kv[:, 449::2] = odd
     table = torch.empty(1, 64)
-    table[:, :32] = 0.5443320274353027
-    table[:, 32:] = 0.8388698697090149
+    table[:, :32] = cosine
+    table[:, 32:] = sine
     slots, positions = torch.tensor([0]), torch.tensor([0])
     cache = torch.zeros(1, 32, 512, dtype=torch.bfloat16)
     torch_reference(kv, cache, slots, positions, table, 32, _rope_fma_on_cos=True)
-    assert cache[0, 0, 449].item() == 0.67578125
+    assert cache[0, 0, dimension].item() == metax_value
     torch_reference(kv, cache, slots, positions, table, 32)
-    assert cache[0, 0, 449].item() == 0.6796875
+    assert cache[0, 0, dimension].item() == default_value
 
 
 def _native_fp8_bytes(values):
