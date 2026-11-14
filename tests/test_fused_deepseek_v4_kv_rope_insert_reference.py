@@ -97,6 +97,21 @@ def test_rope_pair_order_and_position_lookup():
     assert torch.equal(kv, before)
 
 
+def test_metax_reference_fma_order_at_bf16_boundary():
+    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+    kv[:, 448::2] = -0.5
+    kv[:, 449::2] = 2.015625
+    table = torch.empty(1, 64)
+    table[:, :32] = 0.5443320274353027
+    table[:, 32:] = 0.8388698697090149
+    slots, positions = torch.tensor([0]), torch.tensor([0])
+    cache = torch.zeros(1, 32, 512, dtype=torch.bfloat16)
+    torch_reference(kv, cache, slots, positions, table, 32, _rope_fma_on_cos=True)
+    assert cache[0, 0, 449].item() == 0.67578125
+    torch_reference(kv, cache, slots, positions, table, 32)
+    assert cache[0, 0, 449].item() == 0.6796875
+
+
 def _native_fp8_bytes(values):
     return values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
 

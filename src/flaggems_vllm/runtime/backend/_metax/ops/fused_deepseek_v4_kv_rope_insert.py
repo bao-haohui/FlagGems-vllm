@@ -29,10 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def _fp8_bytes(values):
-    # The packed MetaX conversion can canonicalize an exact negative zero.
-    # Preserve the FP32 sign explicitly, including values rounding to FP8 zero.
-    sign = (values.to(tl.int32, bitcast=True) >> 24) & 0x80
+def _fp8_bytes(values, unscaled):
+    # Preserve the sign before scaling: the MetaX multiply can canonicalize
+    # an exact negative zero. All supported quantization scales are positive.
+    sign = (unscaled.to(tl.int32, bitcast=True) >> 24) & 0x80
     encoded = tl.clamp(values, -448.0, 448.0).to(tl.float8e4nv)
     bits = encoded.to(tl.uint8, bitcast=True)
     return ((bits & 0x7F) | sign).to(tl.uint8)
@@ -50,7 +50,7 @@ def _quantize_ue8m0(values, BLOCK_TOKENS: tl.constexpr, GROUP_SIZE: tl.constexpr
     code = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     inverse = ((254 - code) << 23).to(tl.float32, bitcast=True)
     scaled = tiles * inverse[:, :, None]
-    quantized = _fp8_bytes(scaled)
+    quantized = _fp8_bytes(scaled, tiles)
     return tl.reshape(quantized, (BLOCK_TOKENS, 512)), code.to(tl.uint8)
 
 
@@ -156,7 +156,9 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
             # Per-tensor FP8 quantizes FP32 RoPE directly: no BF16 round trip.
             scaled = rotated * (1.0 / tl.load(fp8_scale))
             tl.store(
-                dst.to(tl.pointer_type(tl.uint8)), _fp8_bytes(scaled), live[:, None]
+                dst.to(tl.pointer_type(tl.uint8)),
+                _fp8_bytes(scaled, rotated),
+                live[:, None],
             )
         else:
             # MXFP8, unlike per-tensor FP8, rounds RoPE to BF16 first.

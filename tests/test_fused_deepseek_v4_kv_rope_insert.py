@@ -324,7 +324,7 @@ def test_skipped_positions_are_not_read(cache_format, all_skipped):
 
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
-@pytest.mark.parametrize("cache_format", ["fp8", "packed_v4", "mxfp8"])
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 def test_fp8_rounding_and_scale_boundaries(cache_format):
     # BF16 neighbors of every E4M3 midpoint, signed zero, saturation, tiny
     # groups and maxima exactly at/on either side of UE8M0 power boundaries.
