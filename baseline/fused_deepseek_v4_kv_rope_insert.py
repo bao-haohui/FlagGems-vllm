@@ -221,6 +221,7 @@ def build_inputs(
     slot_mapping=None,
     position_offset=0,
     scale_value=0.5,
+    cache_fill=0xA5,
 ):
     num_tokens = binding["num_tokens"]
     num_insert = binding["num_tokens_insert"]
@@ -235,7 +236,10 @@ def build_inputs(
     itemsize = 2 if cache_dtype == torch.bfloat16 else 1
     # Raw bytes, as in PR #849: creating test inputs must not need an FP8 cast.
     backing = torch.full(
-        (num_blocks, page_stride * itemsize), 0xA5, dtype=torch.uint8, device=device
+        (num_blocks, page_stride * itemsize),
+        cache_fill,
+        dtype=torch.uint8,
+        device=device,
     ).view(cache_dtype)
     cache = backing.as_strided((num_blocks, block_size, width), (page_stride, width, 1))
     # Unique shuffled slots stress paged writes; larger cases mask one row.

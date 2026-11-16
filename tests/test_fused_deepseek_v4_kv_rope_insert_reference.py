@@ -30,6 +30,42 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
 pytestmark = pytest.mark.fused_deepseek_v4_kv_rope_insert
 
 
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+@pytest.mark.parametrize("num_insert", [1, 2, 17])
+def test_benchmark_inputs_match_pr1083(cache_format, num_insert):
+    binding = {
+        "num_tokens": num_insert + 3,
+        "num_tokens_insert": num_insert,
+        "cache_block_size": 32,
+        "cache_format": cache_format,
+    }
+    args, _ = build_inputs(binding, torch.bfloat16, "cpu", cache_fill=0)
+    kv, cache, slots, positions, table, block_size, scale, mxfp8 = args
+    assert kv.shape == (num_insert + 3, 512)
+    assert kv.dtype == torch.bfloat16
+    assert cache.is_contiguous()
+    assert torch.count_nonzero(cache.view(torch.uint8)) == 0
+    assert cache.shape[0] == (num_insert + 31) // 32 + 1
+    assert slots.shape == (num_insert,)
+    assert slots.dtype == torch.int64
+    assert (slots < 0).sum().item() == int(num_insert > 1)
+    if num_insert > 1:
+        assert slots[-1].item() == -1
+    live = slots[slots >= 0]
+    assert live.unique().numel() == live.numel()
+    assert torch.all((live >= 0) & (live < num_insert))
+    assert torch.equal(positions, torch.arange(num_insert + 3))
+    assert table.shape == (num_insert + 3, 64)
+    assert table.dtype == torch.float32
+    assert block_size == 32
+    assert mxfp8 == (cache_format == "mxfp8")
+    if cache_format == "fp8":
+        assert scale.dtype == torch.float32
+        assert scale.item() == 0.5
+    else:
+        assert scale is None
+
+
 def test_explicit_native_namespace_is_selected(monkeypatch):
     def entrypoint(*args):
         return None
