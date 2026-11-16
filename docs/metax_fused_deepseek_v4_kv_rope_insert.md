@@ -2,11 +2,13 @@
 
 ## 当前状态
 
-2026-11-15，分支 `codex/metax-fused-deepseek-v4-kv-rope-insert`，从现有
+2026-11-16，分支 `codex/metax-fused-deepseek-v4-kv-rope-insert`，从现有
 `b232a69fc6c0b4ff3d4f7151c0d8cb171ec79ef7` 派生，保留已有 NVIDIA/Ascend 实现。
 MetaX 实现、后端导出、tuning 配置、功能测试和原生 benchmark 接入已完成。
 MC550 真实编译与设备功能 108/108、CPU 参考 24/24、三方对拍 34/34 通过；
-40 组同栈 CUDA Graph 性能全部达标。模型端到端及其他 MetaX 设备尚未验证。
+11月15日的性能结果保留为历史记录；正式性能口径已按参考 PR 调整为仓库
+benchmark 的 Kernel / CUDA Graph 双模式和逐用例加速比算术平均。
+模型端到端及其他 MetaX 设备尚未验证。
 
 实测生产代码为 `11dd7b7`，kernel 文件 SHA256：
 `7edec4bc18dc598115bd60eb4f0465c936a1f8bfad4982a4811fd4b59a8591a2`。
@@ -137,13 +139,15 @@ export KV_ROPE_NATIVE_NAMESPACE=my_native_namespace
 export TRITON_PRINT_AUTOTUNING=1
 python -m pytest -q tests/test_fused_deepseek_v4_kv_rope_insert.py --quick
 python -m pytest -q tests/test_fused_deepseek_v4_kv_rope_insert.py
-python -m pytest -q benchmark/test_fused_deepseek_v4_kv_rope_insert.py \
-  --level core --mode cudagraph --warmup 10 --iter 30 --record json \
-  --output /path/to/private/results.json
+for mode in kernel cudagraph; do
+  python -m pytest -q -s benchmark/test_fused_deepseek_v4_kv_rope_insert.py \
+    --level comprehensive --mode "$mode" --warmup 1000 --iter 100 \
+    --parallel 0 --record json --output "/path/to/private/benchmark-$mode.json"
+done
 ```
 
 显式选择的库或 namespace 不可用时直接报错；不会静默改用 Torch 计时。
-MetaX benchmark 在无原生入口时跳过，避免把 Torch reference 的延迟误称为原生基线。
+benchmark 和 PR1083 一样在无原生入口时跳过，性能路径只接受原生基线。
 Torch reference 仍可用于精度核查。基线/库注册仅存在于 baseline、tests、benchmark，
 生产实现不会导入这些模块。
 
@@ -163,8 +167,97 @@ Torch2.8/MACA3.7 与原生基线 Torch2.10/MACA3.9 不能直接比较；本轮�
 
 性能 active set 固定为 `benchmark/core_shapes.yaml` 中该算子的 10 组 shape × 四格式，
 S=32、M=1/2/4/8/64/100/1024/2048/8192/16384，1024 行用例有 N=1027 的 DP padding。
-采用原生延迟/Triton 延迟，单位 ms；汇总最小值、各格式几何均值和未达 0.9 的 shape。
+采用原生延迟/Triton 延迟，单位 ms；对每格式10个逐用例比值和总体40个比值
+分别取算术平均，同时报告最小值和未达 0.9 的 shape。
 不以总体平均掩盖单项回归。模型端到端性能不等于算子 CUDA Graph 延迟。
+
+### 对齐参考 PR 的正式测量口径（2026-11-16）
+
+PR1083 固定版本 `9a7624f35f1dfde3c1891b660ccd32443c174b5f`，PR849 固定版本
+`e1d87fcdd7d5725af325e7034ebd3f9e9c3f644f`。代码沿用 Apache 头、Black/isort/flake8、
+后端 override 导出和 `base.Benchmark` 子类；MetaX 的 tile/autotune 与数值兼容修正
+服务于本设备和原生数值契约，保留已验证实现。未把另一个算子的固定发射参数照搬过来。
+
+- 输入与 PR1083 保持同一分布/布局：BF16 KV，零初始化缓存，乱序唯一 slot；
+  M>1 时最后一个 slot 为 -1，M=1 时有效。位置为 0..N-1，S=32，FP8 scale=0.5。
+  不再为性能测量强制全部 slot 有效。保留 uint8 分配后 view，以避开厂商 FP8 cast 依赖。
+- 每个格式测试开始前固定 `torch.manual_seed(0)`，两种模式使用相同构造流程。
+  功能测试继续默认使用 0xA5 哨兵缓存，完整 backing 的越界/漏写检查保留。
+- 正式计时全部由仓库 pytest benchmark 完成，`--level comprehensive`，
+  该算子 comprehensive 和 core 均为10组 shape；`--parallel 0` 串行。
+- Kernel 使用 `triton.testing.do_bench`，warmup=1000ms、rep=100ms、median；
+  CUDA Graph 使用 `do_bench_cudagraph`，rep=100ms、median，warmup 由该 helper 管理。
+  Graph 分支不读取 CLI 的 `--warmup`，不能将其描述成 Graph 额外预热1000ms。
+- 同一输入先由原生计时，再由 Triton 计时，沿用仓库顺序；输入、JIT、调优、库加载
+  不计入正式延迟。两者共用相同 Torch/MACA 栈，未修改全局 benchmark 计时实现。
+- 独立脚本只做40组完整缓存字节对拍、KV只读核查和 JSON 后处理，不执行正式计时。
+  后处理必须验证两份 JSON 各有4格式/40条成功记录，使用 `mean(native_ms/triton_ms)`，
+  不使用几何平均，也不使用 `mean(native_ms)/mean(triton_ms)`。
+
+### 正式重测结果（2026-11-16）
+
+benchmark 代码为 `a78e59d`，生产 kernel 与原生库哈希均保持不变。
+本地及服务器 CPU 同组36/36通过，新增benchmark输入40/40完整缓存字节和KV只读对拍通过；
+Kernel / CUDA Graph 各4个pytest格式测试通过、各40条成功记录，执行exit0。
+两模式共80条性能记录，全部高于0.9；没有触发进一步性能优化。模型端到端未运行。
+新调优结果额外选择 `BLOCK_TOKENS=1, num_warps=2, num_stages=1`；在11月15日
+已验证的8配置之外，该新配置另做四格式随机/尾块4项和四相位零值16项，全部通过。
+
+| 格式 | Kernel 算术平均 | Kernel 最小 | CUDA Graph 算术平均 | CUDA Graph 最小 |
+|---|---:|---:|---:|---:|
+| BF16 | 1.493× | 1.333× | 1.484× | 1.185× |
+| per-tensor FP8 | 1.780× | 1.365× | 2.203× | 1.283× |
+| V4 packed | 2.173× | 2.000× | 2.864× | 2.245× |
+| MXFP8 | 2.095× | 1.900× | 2.720× | 1.982× |
+| 总体 | 1.885× | 1.333× | 2.318× | 1.185× |
+
+下表沿用相同40组输入，展示两种计时模式的逐用例延迟和加速比。延迟单位 μs；
+完整精度保存在仓库benchmark输出的两份原始JSON，表中显示值仅作小数舍入。
+
+| 格式 | N / M | Kernel 原生 | Kernel Triton | Kernel 加速比 | Graph 原生 | Graph Triton | Graph 加速比 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| BF16 | 1 / 1 | 9.216 | 6.912 | 1.333× | 3.004 | 1.780 | 1.688× |
+| BF16 | 2 / 2 | 9.216 | 6.912 | 1.333× | 3.027 | 1.990 | 1.521× |
+| BF16 | 4 / 4 | 9.472 | 6.912 | 1.370× | 3.135 | 2.025 | 1.548× |
+| BF16 | 8 / 8 | 9.728 | 6.912 | 1.407× | 3.411 | 2.048 | 1.665× |
+| BF16 | 64 / 64 | 10.496 | 7.168 | 1.464× | 3.506 | 2.247 | 1.560× |
+| BF16 | 100 / 100 | 10.752 | 7.168 | 1.500× | 3.505 | 2.126 | 1.649× |
+| BF16 | 1027 / 1024 | 18.432 | 9.216 | 2.000× | 4.920 | 3.432 | 1.434× |
+| BF16 | 2048 / 2048 | 19.968 | 11.776 | 1.696× | 6.466 | 4.711 | 1.373× |
+| BF16 | 8192 / 8192 | 32.000 | 21.504 | 1.488× | 20.387 | 16.730 | 1.219× |
+| BF16 | 16384 / 16384 | 45.824 | 34.304 | 1.336× | 35.205 | 29.717 | 1.185× |
+| per-tensor FP8 | 1 / 1 | 13.824 | 6.912 | 2.000× | 6.965 | 1.990 | 3.499× |
+| per-tensor FP8 | 2 / 2 | 14.080 | 7.680 | 1.833× | 6.945 | 2.462 | 2.821× |
+| per-tensor FP8 | 4 / 4 | 13.824 | 7.680 | 1.800× | 7.029 | 2.867 | 2.452× |
+| per-tensor FP8 | 8 / 8 | 14.336 | 7.680 | 1.867× | 7.230 | 2.845 | 2.542× |
+| per-tensor FP8 | 64 / 64 | 14.336 | 7.936 | 1.806× | 7.304 | 2.976 | 2.454× |
+| per-tensor FP8 | 100 / 100 | 14.592 | 7.936 | 1.839× | 7.342 | 2.996 | 2.450× |
+| per-tensor FP8 | 1027 / 1024 | 22.272 | 11.008 | 2.023× | 9.682 | 5.733 | 1.689× |
+| per-tensor FP8 | 2048 / 2048 | 25.856 | 14.592 | 1.772× | 12.571 | 8.473 | 1.484× |
+| per-tensor FP8 | 8192 / 8192 | 47.872 | 32.000 | 1.496× | 35.652 | 26.330 | 1.354× |
+| per-tensor FP8 | 16384 / 16384 | 73.728 | 54.016 | 1.365× | 61.810 | 48.190 | 1.283× |
+| V4 packed | 1 / 1 | 17.152 | 7.680 | 2.233× | 10.211 | 2.764 | 3.694× |
+| V4 packed | 2 / 2 | 17.408 | 8.448 | 2.061× | 10.229 | 3.321 | 3.080× |
+| V4 packed | 4 / 4 | 17.408 | 8.448 | 2.061× | 10.223 | 3.332 | 3.068× |
+| V4 packed | 8 / 8 | 17.408 | 8.448 | 2.061× | 10.343 | 3.380 | 3.061× |
+| V4 packed | 64 / 64 | 17.408 | 8.704 | 2.000× | 10.422 | 3.454 | 3.017× |
+| V4 packed | 100 / 100 | 17.664 | 8.704 | 2.029× | 10.469 | 3.524 | 2.970× |
+| V4 packed | 1027 / 1024 | 28.928 | 11.520 | 2.511× | 15.937 | 5.865 | 2.717× |
+| V4 packed | 2048 / 2048 | 35.072 | 14.848 | 2.362× | 21.946 | 8.671 | 2.531× |
+| V4 packed | 8192 / 8192 | 78.848 | 35.584 | 2.216× | 66.265 | 29.510 | 2.245× |
+| V4 packed | 16384 / 16384 | 135.936 | 61.952 | 2.194× | 123.050 | 54.598 | 2.254× |
+| MXFP8 | 1 / 1 | 16.896 | 7.424 | 2.276× | 9.834 | 2.498 | 3.937× |
+| MXFP8 | 2 / 2 | 17.152 | 8.192 | 2.094× | 9.844 | 3.160 | 3.115× |
+| MXFP8 | 4 / 4 | 17.152 | 8.448 | 2.030× | 9.856 | 3.374 | 2.921× |
+| MXFP8 | 8 / 8 | 17.152 | 8.448 | 2.030× | 9.971 | 3.418 | 2.917× |
+| MXFP8 | 64 / 64 | 17.152 | 8.448 | 2.030× | 10.067 | 3.456 | 2.913× |
+| MXFP8 | 100 / 100 | 17.408 | 8.704 | 2.000× | 10.095 | 3.565 | 2.832× |
+| MXFP8 | 1027 / 1024 | 28.160 | 11.776 | 2.391× | 15.257 | 6.469 | 2.358× |
+| MXFP8 | 2048 / 2048 | 33.792 | 15.360 | 2.200× | 20.975 | 9.362 | 2.240× |
+| MXFP8 | 8192 / 8192 | 76.032 | 38.144 | 1.993× | 63.131 | 31.758 | 1.988× |
+| MXFP8 | 16384 / 16384 | 131.840 | 69.376 | 1.900× | 117.507 | 59.300 | 1.982× |
+
+### 11月15日的功能和优化历史
 
 功能测试补充负 slot 配无效 position/空表、全部 FP8 midpoint 的 BF16 邻值、UE8M0
 边界、负零、饱和、非零 cache storage offset、非法 packed 布局，以及 per-tensor FP8
@@ -194,7 +287,9 @@ S=32、M=1/2/4/8/64/100/1024/2048/8192/16384，1024 行用例有 N=1027 的 DP p
 | 精度收敛 | 两cos FMA、乘积符号零、位运算取负和量化前符号保留 | 108项功能、34组三方、32配置随机、128配置零值全部通过 | keep |
 | 配置选择 | 六组基础候选及AABS实测派生配置 | 所有40条性能输入先与原生字节比较 | 全部达标，keep |
 
-计时使用 `triton.testing.do_bench_cudagraph`，每轮30ms、三轮取中位数，交替测量顺序。
+以下性能表为11月15日的历史口径，不能与上面的正式口径混合汇总。
+当时使用独立脚本 `triton.testing.do_bench_cudagraph`，每轮30ms、三轮取中位数，
+交替测量顺序，slot 全部有效，缓存以0xA5初始化。
 原生和 SUT 置于同一进程、同一 Torch/MACA 栈；JIT、autotune、输入构造和库加载在计时外。
 下面的几何平均对每格式10个M等权，最小值单独报告；全部 shape 的原生/SUT 延迟和
 实际 best config 已保存。本表中的大M延迟为 M=N=16384，单位 μs。
