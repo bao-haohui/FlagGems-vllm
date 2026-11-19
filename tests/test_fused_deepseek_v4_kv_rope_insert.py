@@ -31,7 +31,7 @@ from . import conftest as cfg
 
 VLLM_REF = native(flaggems_vllm.device)
 TORCH_REF = functools.partial(
-    torch_reference, _rope_fma_on_cos=flaggems_vllm.vendor_name == "metax"
+    torch_reference, _rope_fma_on_cos=flaggems_vllm.vendor_name in ("metax", "thead")
 )
 REFERENCE = VLLM_REF or TORCH_REF
 
@@ -292,8 +292,8 @@ def test_noncontiguous_token_stride(cache_format):
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_public_api_selects_backend_override():
     vendor = flaggems_vllm.vendor_name
-    if vendor not in ("ascend", "metax"):
-        pytest.skip("Ascend/MetaX backend dispatch check")
+    if vendor not in ("ascend", "metax", "thead"):
+        pytest.skip("Backend override dispatch check")
     assert f"._{vendor}.ops." in (
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert.__module__
     )
@@ -303,7 +303,7 @@ def test_public_api_selects_backend_override():
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @pytest.mark.parametrize("all_skipped", [False, True])
 def test_skipped_positions_are_not_read(cache_format, all_skipped):
-    if flaggems_vllm.vendor_name not in ("ascend", "metax"):
+    if flaggems_vllm.vendor_name not in ("ascend", "metax", "thead"):
         pytest.skip("Backend extensions allow invalid positions on skipped rows")
     slots = torch.tensor([3, -7, 1, -99, 8], device=flaggems_vllm.device)
     if all_skipped:
@@ -434,11 +434,11 @@ def test_per_tensor_fp8_does_not_round_rope_through_bf16():
         ),
     ],
 )
-def test_metax_native_rope_fma_order(
+def test_native_rope_fma_order(
     cache_format, even, odd, cosine, sine, dimension, expected_value, scale
 ):
-    if flaggems_vllm.vendor_name != "metax":
-        pytest.skip("MACA native FMA contraction order")
+    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+        pytest.skip("Vendor native cosine FMA contraction order")
     inputs = _make_inputs(1, 1, 32, cache_format, scale_value=scale)
     inputs["kv"].zero_()
     inputs["kv"][:, 448::2] = even
@@ -466,9 +466,9 @@ def test_metax_native_rope_fma_order(
 @pytest.mark.parametrize(
     "cosine,sine", [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
 )
-def test_metax_rope_signed_zeros(cache_format, cosine, sine):
-    if flaggems_vllm.vendor_name != "metax":
-        pytest.skip("MetaX vector multiplication signed-zero regression")
+def test_native_rope_signed_zeros(cache_format, cosine, sine):
+    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+        pytest.skip("Native RoPE signed-zero regression")
     slots = torch.arange(17, device=flaggems_vllm.device)
     inputs = _make_inputs(20, 17, 32, cache_format, scale_value=1.0, slot_mapping=slots)
     values = (
@@ -496,9 +496,9 @@ def test_metax_rope_signed_zeros(cache_format, cosine, sine):
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("invalid", ["token_stride", "page_stride", "alignment"])
-def test_metax_rejects_unsupported_packed_layout(invalid):
-    if flaggems_vllm.vendor_name != "metax":
-        pytest.skip("MetaX packed-layout validation")
+def test_backend_rejects_unsupported_packed_layout(invalid):
+    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+        pytest.skip("Backend packed-layout validation")
     inputs = _make_inputs(4, 4, 32, "packed_v4")
     shape = inputs["k_cache"].shape
     page = shape[1] * shape[2]
@@ -546,3 +546,59 @@ def test_reference_encoder_matches_cpu_at_fp8_midpoints():
     expected = values.to(torch.float8_e4m3fn).view(torch.uint8)
     actual = encode_e4m3(values.to(flaggems_vllm.device)).cpu()
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+def test_thead_encoder_all_finite_fp16_values():
+    if flaggems_vllm.vendor_name != "thead":
+        pytest.skip("PPU software E4M3 encoder sweep")
+    values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    values = values[torch.isfinite(values)].float()
+    count = values.numel() // 32
+    slots = torch.arange(count, device=flaggems_vllm.device)
+    inputs = _make_inputs(count, count, 32, "fp8", scale_value=1.0, slot_mapping=slots)
+    inputs["kv"].zero_()
+    inputs["kv"][:, 448::2] = 1
+    inputs["position_ids"] = slots
+    table = torch.cat((values.reshape(count, 32), torch.zeros(count, 32)), dim=1)
+    inputs["cos_sin_cache"] = table.to(flaggems_vllm.device)
+    native_cache = inputs["k_cache"].clone()
+    if VLLM_REF is not None:
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    if VLLM_REF is not None:
+        _assert_bytes_equal(inputs["k_cache"], native_cache)
+    actual = inputs["k_cache"].cpu().view(torch.uint8).reshape(-1, 512)
+    expected = values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(actual[:count, 448::2].reshape(-1), expected)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+def test_thead_ue8m0_all_positive_finite_bf16_maxima():
+    if flaggems_vllm.vendor_name != "thead":
+        pytest.skip("PPU integer UE8M0 exponent sweep")
+    maxima = (
+        torch.arange(0x7F80, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    )
+    count = (maxima.numel() + 6) // 7
+    padded = torch.zeros(count * 7, dtype=torch.bfloat16)
+    padded[: maxima.numel()] = maxima
+    slots = torch.arange(count, device=flaggems_vllm.device)
+    inputs = _make_inputs(count, count, 32, "packed_v4", slot_mapping=slots)
+    values = torch.zeros(count, 512, dtype=torch.bfloat16)
+    values[:, :448] = (
+        padded.reshape(count, 7, 1).expand(count, 7, 64).reshape(count, 448)
+    )
+    inputs["kv"] = values.to(flaggems_vllm.device)
+    inputs["cos_sin_cache"][:, :32].fill_(1)
+    inputs["cos_sin_cache"][:, 32:].zero_()
+    native_cache = inputs["k_cache"].clone()
+    if VLLM_REF is not None:
+        VLLM_REF(**dict(inputs, k_cache=native_cache))
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    if VLLM_REF is not None:
+        _assert_bytes_equal(inputs["k_cache"], native_cache)
+    pages = inputs["k_cache"].cpu().reshape(-1, 32 * 584)
+    codes = pages[:, 32 * 576 :].reshape(-1, 8)[:count, :7].reshape(-1)
+    exponent = torch.ceil(torch.log2(maxima.float().clamp_min(1e-4) / 448))
+    assert torch.equal(codes[: maxima.numel()], (exponent + 127).to(torch.uint8))

@@ -16,13 +16,18 @@ import logging
 
 import torch
 import triton
-import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 from flaggems_vllm.utils import triton_lang_extension as ext
+
+_HAS_TLE_LOAD = has_triton_tle_attrs(("load",))
+if _HAS_TLE_LOAD:
+    import triton.experimental.tle.language as tle
+else:
+    tle = None
 
 logger = logging.getLogger(__name__)
 
@@ -522,6 +527,8 @@ def _int8_block_bmm(
     Tuned shapes may accumulate in FP32; fallback shapes accumulate in BF16.
     The output dtype does not override this internal accumulation choice.
     """
+    if not _HAS_TLE_LOAD:
+        raise NotImplementedError("INT8 block BMM requires Triton TLE load support")
     tensors = (A, B, A_scale, B_scale)
     if any(t.device != A.device for t in tensors) or A.device.type != "cuda":
         raise ValueError("all inputs must be on the same PPU device")
