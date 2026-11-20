@@ -14,14 +14,21 @@
 
 """Native collection contract and independent Torch reference; never production."""
 
+import hashlib
 import importlib
 import os
+from pathlib import Path
 
 import torch
 
 OP_NAME = "fused_deepseek_v4_kv_rope_insert"
 DTYPES = [torch.bfloat16]
 IS_INPLACE = True
+
+MTHREADS_SOURCE_SHA256 = (
+    "3fcb87272adac3975d3c5dad292a3e815dd72ab1345d125e0533e79dd3d19f6c"
+)
+_mthreads_module = None
 
 # Input KV is always BF16; cache format is an independent collection dimension.
 CACHE_FORMATS = ("bf16", "fp8", "packed_v4", "mxfp8")
@@ -65,6 +72,50 @@ def native(device=None):
         return None
     op = getattr(torch.ops._C, OP_NAME, None)
     return op if callable(op) else None
+
+
+def mthreads_baseline(
+    kv,
+    k_cache,
+    slot_mapping,
+    position_ids,
+    cos_sin_cache,
+    cache_block_size,
+    fp8_scale=None,
+    kv_mxfp8=False,
+):
+    """Unchanged official Triton V4 writer with zero Q; no compute fallback."""
+    global _mthreads_module
+    if k_cache.dtype != torch.uint8 or k_cache.shape[-1] != 584 or kv_mxfp8:
+        raise NotImplementedError("the official MUSA writer supports V4 packed only")
+    if _mthreads_module is None:
+        module = importlib.import_module("vllm_musa.kernels.deepseek_v4_rope_kv_insert")
+        if (
+            hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+            != MTHREADS_SOURCE_SHA256
+        ):
+            raise RuntimeError("the official MUSA baseline source has changed")
+        _mthreads_module = module
+    module = _mthreads_module
+    count = slot_mapping.numel()
+    q = torch.empty((count, 0, 512), dtype=kv.dtype, device=kv.device)
+    rows, positions = kv[:count], position_ids[:count]
+    if not module.rope_kv_insert_supported(
+        q, rows, k_cache, slot_mapping, positions, cos_sin_cache, cache_block_size, 0
+    ):
+        raise NotImplementedError("the official MUSA writer rejected this input")
+    module.rope_kv_insert(
+        q,
+        rows,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        1e-6,
+        cache_block_size,
+        0,
+        False,
+    )
 
 
 def _integer_power_of_two(exponent):
@@ -118,6 +169,7 @@ def torch_reference(
     *,
     _assume_all_valid=False,
     _rope_fma_on_cos=False,
+    _rope_fma_on_even=False,
 ):
     """Complete unfused reference, preserving input KV and physical cache gaps.
 
@@ -141,7 +193,19 @@ def torch_reference(
     cosine, sine = angles[:, :32], angles[:, 32:]
     pairs = values[:, 448:].reshape(-1, 32, 2)
     rotated = values.clone()
-    if _rope_fma_on_cos:
+    if _rope_fma_on_even:
+        if kv.device.type != "cpu":
+            raise RuntimeError("the MUSA FMA oracle must run on the CPU")
+        even, odd = pairs[:, :, 0], pairs[:, :, 1]
+        # BF16 x FP32 fits in FP64: round only once for each explicit FP32
+        # FMA. The other product is rounded to FP32 before the addition.
+        rotated[:, 448::2] = (
+            even.double() * cosine.double() - (odd * sine).double()
+        ).float()
+        rotated[:, 449::2] = (
+            even.double() * sine.double() + (odd * cosine).double()
+        ).float()
+    elif _rope_fma_on_cos:
         # The official MACA compiler contracts the cosine term in both outputs.
         rotated[:, 448::2] = torch.addcmul(
             -(pairs[:, :, 1] * sine), pairs[:, :, 0], cosine
@@ -188,6 +252,32 @@ def torch_reference(
         scale_view = pages[:, data_end:].view(-1, cache_block_size, scale_bytes)
         data_view[block, offset] = payload
         scale_view[block, offset] = scales
+
+
+def mthreads_cpu_reference(
+    kv,
+    k_cache,
+    slot_mapping,
+    position_ids,
+    cos_sin_cache,
+    cache_block_size,
+    fp8_scale=None,
+    kv_mxfp8=False,
+):
+    """CPU-only numerical oracle, copied back solely for functional tests."""
+    cpu_cache = k_cache.cpu()
+    torch_reference(
+        kv.cpu(),
+        cpu_cache,
+        slot_mapping.cpu(),
+        position_ids.cpu(),
+        cos_sin_cache.cpu(),
+        cache_block_size,
+        fp8_scale.cpu() if fp8_scale is not None else None,
+        kv_mxfp8,
+        _rope_fma_on_even=True,
+    )
+    k_cache.copy_(cpu_cache)
 
 
 def grid():

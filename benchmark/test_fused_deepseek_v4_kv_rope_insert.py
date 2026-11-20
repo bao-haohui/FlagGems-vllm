@@ -20,12 +20,17 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     OP_NAME,
     build_inputs,
+    mthreads_baseline,
     native,
 )
 
 from . import base
 
 VLLM_REF = native(flaggems_vllm.device)
+BENCHMARK_FORMATS = CACHE_FORMATS
+if flaggems_vllm.vendor_name == "mthreads":
+    VLLM_REF = mthreads_baseline
+    BENCHMARK_FORMATS = ("packed_v4",)
 
 pytestmark = [
     pytest.mark.fused_deepseek_v4_kv_rope_insert,
@@ -52,11 +57,13 @@ class FusedDeepseekV4KVRopeInsertBenchmark(base.Benchmark):
             yield args
 
 
-@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+@pytest.mark.parametrize("cache_format", BENCHMARK_FORMATS)
 def test_fused_deepseek_v4_kv_rope_insert(cache_format):
     torch.manual_seed(0)
     bench = FusedDeepseekV4KVRopeInsertBenchmark(cache_format)
     label = f"vLLM native ({flaggems_vllm.vendor_name})"
+    if flaggems_vllm.vendor_name == "mthreads":
+        label = "official vllm-musa Triton (zero Q)"
     print("baseline:", label, "cache_format:", cache_format)
     original_str = base.BenchmarkResult.__str__
 

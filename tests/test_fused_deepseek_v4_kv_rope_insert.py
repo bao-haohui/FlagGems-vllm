@@ -22,6 +22,7 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     build_inputs,
     encode_e4m3,
+    mthreads_cpu_reference,
     native,
     torch_reference,
 )
@@ -33,6 +34,8 @@ VLLM_REF = native(flaggems_vllm.device)
 TORCH_REF = functools.partial(
     torch_reference, _rope_fma_on_cos=flaggems_vllm.vendor_name in ("metax", "thead")
 )
+if flaggems_vllm.vendor_name == "mthreads":
+    TORCH_REF = mthreads_cpu_reference
 REFERENCE = VLLM_REF or TORCH_REF
 
 # Functional coverage retains DP padding and upstream's 256-token page cases.
@@ -303,7 +306,7 @@ def test_public_api_selects_backend_override():
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @pytest.mark.parametrize("all_skipped", [False, True])
 def test_skipped_positions_are_not_read(cache_format, all_skipped):
-    if flaggems_vllm.vendor_name not in ("ascend", "metax", "thead"):
+    if flaggems_vllm.vendor_name not in ("ascend", "metax", "thead", "mthreads"):
         pytest.skip("Backend extensions allow invalid positions on skipped rows")
     slots = torch.tensor([3, -7, 1, -99, 8], device=flaggems_vllm.device)
     if all_skipped:
@@ -467,7 +470,7 @@ def test_native_rope_fma_order(
     "cosine,sine", [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
 )
 def test_native_rope_signed_zeros(cache_format, cosine, sine):
-    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads"):
         pytest.skip("Native RoPE signed-zero regression")
     slots = torch.arange(17, device=flaggems_vllm.device)
     inputs = _make_inputs(20, 17, 32, cache_format, scale_value=1.0, slot_mapping=slots)
@@ -497,7 +500,7 @@ def test_native_rope_signed_zeros(cache_format, cosine, sine):
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("invalid", ["token_stride", "page_stride", "alignment"])
 def test_backend_rejects_unsupported_packed_layout(invalid):
-    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads"):
         pytest.skip("Backend packed-layout validation")
     inputs = _make_inputs(4, 4, 32, "packed_v4")
     shape = inputs["k_cache"].shape
@@ -515,6 +518,41 @@ def test_backend_rejects_unsupported_packed_layout(invalid):
     inputs["k_cache"] = backing.as_strided(shape, strides)
     with pytest.raises(NotImplementedError):
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+
+
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
+@pytest.mark.parametrize("cache_format", CACHE_FORMATS)
+@pytest.mark.parametrize(
+    "even,odd,cosine,sine,dimension,value",
+    [
+        (-0.5, 2.015625, 0.5443320274353027, 0.8388698697090149, 449, 0.6796875),
+        (
+            0.671875,
+            -1.359375,
+            0.9095131158828735,
+            -0.4156752824783325,
+            448,
+            0.046142578125,
+        ),
+    ],
+)
+def test_mthreads_rope_fma_order(
+    cache_format, even, odd, cosine, sine, dimension, value
+):
+    if flaggems_vllm.vendor_name != "mthreads":
+        pytest.skip("MUSA writer's even-cos and odd-sin FMA order")
+    inputs = _make_inputs(1, 1, 32, cache_format, scale_value=1.0)
+    inputs["kv"].zero_()
+    inputs["kv"][:, 448::2] = even
+    inputs["kv"][:, 449::2] = odd
+    inputs["cos_sin_cache"][:, :32].fill_(cosine)
+    inputs["cos_sin_cache"][:, 32:].fill_(sine)
+    expected = inputs["k_cache"].clone()
+    TORCH_REF(**dict(inputs, k_cache=expected))
+    if cache_format == "bf16":
+        assert expected[0, 0, dimension].item() == value
+    flaggems_vllm.fused_deepseek_v4_kv_rope_insert(**inputs)
+    _assert_bytes_equal(inputs["k_cache"], expected)
 
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert

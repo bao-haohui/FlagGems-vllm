@@ -173,6 +173,42 @@ def test_metax_reference_fma_order_at_bf16_boundary(
     assert cache[0, 0, dimension].item() == default_value
 
 
+@pytest.mark.parametrize(
+    "even,odd,cosine,sine,dimension,value",
+    [
+        (-0.5, 2.015625, 0.5443320274353027, 0.8388698697090149, 449, 0.6796875),
+        (
+            0.671875,
+            -1.359375,
+            0.9095131158828735,
+            -0.4156752824783325,
+            448,
+            0.046142578125,
+        ),
+        (-0.0, 1.0, 1.0, 0.0, 448, -0.0),
+    ],
+)
+def test_mthreads_reference_fma_and_negative_zero(
+    even, odd, cosine, sine, dimension, value
+):
+    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+    kv[:, 448::2], kv[:, 449::2] = even, odd
+    table = torch.empty(1, 64)
+    table[:, :32], table[:, 32:] = cosine, sine
+    cache = torch.zeros(1, 32, 512, dtype=torch.bfloat16)
+    torch_reference(
+        kv,
+        cache,
+        torch.tensor([0]),
+        torch.tensor([0]),
+        table,
+        32,
+        _rope_fma_on_even=True,
+    )
+    expected = torch.tensor(value, dtype=torch.bfloat16).view(torch.int16)
+    assert torch.equal(cache[0, 0, dimension].view(torch.int16), expected)
+
+
 def _native_fp8_bytes(values):
     return values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
 
