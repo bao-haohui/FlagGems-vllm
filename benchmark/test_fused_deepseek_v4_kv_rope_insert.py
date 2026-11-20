@@ -29,6 +29,10 @@ from . import base
 VLLM_REF = native(flaggems_vllm.device)
 BENCHMARK_FORMATS = CACHE_FORMATS
 if flaggems_vllm.vendor_name == "mthreads":
+    # The common benchmark uses torch.cuda event/graph names. Match the
+    # repository's MUSA functional harness through the vendor adapter.
+    import torchada  # noqa: F401
+
     VLLM_REF = mthreads_baseline
     BENCHMARK_FORMATS = ("packed_v4",)
 

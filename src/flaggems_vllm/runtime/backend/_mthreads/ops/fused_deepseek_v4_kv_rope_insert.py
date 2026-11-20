@@ -15,6 +15,7 @@
 """MThreads KV-only RoPE and paged cache insertion for DeepSeek V4."""
 
 import logging
+import statistics
 from typing import Optional
 
 import torch
@@ -28,14 +29,50 @@ from flaggems_vllm.utils import libentry, libtuner
 logger = logging.getLogger(__name__)
 
 
+def _bench_musa_graph(fn, quantiles=None, rep_ms=20):
+    """Autotune with MUSA events/graphs, without CUDA compatibility patches."""
+    fn()
+    torch_device_fn.synchronize()
+
+    def samples(calls, repetitions):
+        graph = torch_device_fn.MUSAGraph()
+        with torch_device_fn.graph(graph):
+            for _ in range(calls):
+                fn()
+        graph.replay()
+        values = []
+        for _ in range(repetitions):
+            start = torch_device_fn.Event(enable_timing=True)
+            end = torch_device_fn.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            values.append(start.elapsed_time(end) / calls)
+        return values
+
+    estimate = max(samples(10, 1)[0], 1e-6)
+    calls = max(32, min(4096, int(rep_ms / estimate)))
+    values = sorted(samples(calls, 5))
+    if quantiles is None:
+        return statistics.median(values)
+    result = []
+    for quantile in quantiles:
+        position = quantile * (len(values) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(values) - 1)
+        result.append(
+            values[lower] + (values[upper] - values[lower]) * (position - lower)
+        )
+    return result
+
+
 @triton.jit
-def _fp8_bytes(values, unscaled):
-    # Keep the input zero sign explicit through scaling and the native E4M3
-    # conversion. Supported quantization scales are positive.
-    sign = (unscaled.to(tl.int32, bitcast=True) >> 24) & 0x80
+def _fp8_bytes(values):
+    # MUSA's native conversion preserves zero signs. Unlike the MetaX/PPU
+    # encoders, this path needs no per-element sign extraction and repair.
     encoded = tl.clamp(values, -448.0, 448.0).to(tl.float8e4nv)
-    bits = encoded.to(tl.uint8, bitcast=True)
-    return ((bits & 0x7F) | sign).to(tl.uint8)
+    return encoded.to(tl.uint8, bitcast=True)
 
 
 @triton.jit
@@ -50,7 +87,9 @@ def _quantize_ue8m0(values, BLOCK_TOKENS: tl.constexpr, GROUP_SIZE: tl.constexpr
     code = (bits >> 23) - 8 + ((bits & 0x7FFFFF) > 0x600000).to(tl.int32)
     inverse = ((254 - code) << 23).to(tl.float32, bitcast=True)
     scaled = tiles * inverse[:, :, None]
-    quantized = _fp8_bytes(scaled, tiles)
+    # The exact power-of-two scale bounds finite BF16-origin groups by 448.
+    # Per-tensor FP8 still needs its separate explicit clamp.
+    quantized = scaled.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
     return tl.reshape(quantized, (BLOCK_TOKENS, 512)), code.to(tl.uint8)
 
 
@@ -65,6 +104,7 @@ def _quantize_ue8m0(values, BLOCK_TOKENS: tl.constexpr, GROUP_SIZE: tl.constexpr
         "cache_token_stride",
     ],
     use_cuda_graph=True,
+    do_bench=_bench_musa_graph,
 )
 @triton.jit
 def _fused_deepseek_v4_kv_rope_insert_kernel(
@@ -82,7 +122,14 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
     BLOCK_TOKENS: tl.constexpr,
 ):
     tokens = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
-    slots = tl.load(slot_mapping + tokens, tokens < num_tokens, other=-1)
+    if BLOCK_TOKENS == 1:
+        # A scalar slot test lets a skipped token leave before any vector work.
+        slot = tl.load(slot_mapping + tl.program_id(0))
+        if slot < 0:
+            return
+        slots = tl.full((1,), 0, tl.int64) + slot
+    else:
+        slots = tl.load(slot_mapping + tokens, tokens < num_tokens, other=-1)
     live = (tokens < num_tokens) & (slots >= 0)
     # Mask before following positions: skipped rows may have invalid position
     # IDs, including an entirely empty cos/sin table when all slots are negative.
@@ -164,7 +211,7 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
             scaled = rotated * (1.0 / tl.load(fp8_scale))
             tl.store(
                 dst.to(tl.pointer_type(tl.uint8)),
-                _fp8_bytes(scaled, rotated),
+                _fp8_bytes(scaled),
                 live[:, None],
             )
         else:

@@ -16,6 +16,12 @@ fused_deepseek_v4_kv_rope_insert:
 - META: {BLOCK_TOKENS: 1}
   num_warps: 1
   num_stages: 1
+- META: {BLOCK_TOKENS: 1}
+  num_warps: 2
+  num_stages: 1
+- META: {BLOCK_TOKENS: 1}
+  num_warps: 4
+  num_stages: 1
 - META: {BLOCK_TOKENS: 2}
   num_warps: 1
   num_stages: 1

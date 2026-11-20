@@ -295,7 +295,7 @@ def test_noncontiguous_token_stride(cache_format):
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_public_api_selects_backend_override():
     vendor = flaggems_vllm.vendor_name
-    if vendor not in ("ascend", "metax", "thead"):
+    if vendor not in ("ascend", "metax", "thead", "mthreads"):
         pytest.skip("Backend override dispatch check")
     assert f"._{vendor}.ops." in (
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert.__module__
@@ -588,8 +588,8 @@ def test_reference_encoder_matches_cpu_at_fp8_midpoints():
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_thead_encoder_all_finite_fp16_values():
-    if flaggems_vllm.vendor_name != "thead":
-        pytest.skip("PPU software E4M3 encoder sweep")
+    if flaggems_vllm.vendor_name not in ("thead", "mthreads"):
+        pytest.skip("Backend E4M3 conversion sweep")
     values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
     values = values[torch.isfinite(values)].float()
     count = values.numel() // 32
@@ -613,8 +613,8 @@ def test_thead_encoder_all_finite_fp16_values():
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_thead_ue8m0_all_positive_finite_bf16_maxima():
-    if flaggems_vllm.vendor_name != "thead":
-        pytest.skip("PPU integer UE8M0 exponent sweep")
+    if flaggems_vllm.vendor_name not in ("thead", "mthreads"):
+        pytest.skip("Backend integer UE8M0 exponent sweep")
     maxima = (
         torch.arange(0x7F80, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
     )
@@ -640,3 +640,9 @@ def test_thead_ue8m0_all_positive_finite_bf16_maxima():
     codes = pages[:, 32 * 576 :].reshape(-1, 8)[:count, :7].reshape(-1)
     exponent = torch.ceil(torch.log2(maxima.float().clamp_min(1e-4) / 448))
     assert torch.equal(codes[: maxima.numel()], (exponent + 127).to(torch.uint8))
+    if flaggems_vllm.vendor_name == "mthreads":
+        padded_exponent = torch.ceil(torch.log2(padded.float().clamp_min(1e-4) / 448))
+        expected = encode_e4m3(padded.float() * torch.exp2(-padded_exponent))
+        expected = expected.reshape(count, 7, 1).expand(count, 7, 64)
+        payload = pages[:, : 32 * 576].reshape(-1, 576)[:count, :448]
+        assert torch.equal(payload, expected.reshape(count, 448))
