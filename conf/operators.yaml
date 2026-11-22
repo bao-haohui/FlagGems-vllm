@@ -534,6 +534,7 @@ ops:
       MetaX backend tunes multi-token tiles and uses Triton E4M3 conversion.
       THead backend tunes multi-token tiles and encodes E4M3 bytes in Triton.
       MThreads backend tunes multi-token tiles with native MUSA E4M3 conversion.
+      Hygon backend tunes wave64 token tiles and matches LightOp cosine-FMA RoPE.
     for:
       - torch.ops._C.fused_deepseek_v4_kv_rope_insert
     labels:

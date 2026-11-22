@@ -29,6 +29,10 @@ MTHREADS_SOURCE_SHA256 = (
     "3fcb87272adac3975d3c5dad292a3e815dd72ab1345d125e0533e79dd3d19f6c"
 )
 _mthreads_module = None
+HYGON_LIBRARY_SHA256 = (
+    "59ec2cf5b8e29d7c6bfc8a4b8d633c5cd65b0bcdb988e2bb9a3c0095e4d63cf3"
+)
+_hygon_entry = None
 
 # Input KV is always BF16; cache format is an independent collection dimension.
 CACHE_FORMATS = ("bf16", "fp8", "packed_v4", "mxfp8")
@@ -127,6 +131,54 @@ def _integer_power_of_two(exponent):
     return ((exponent.to(torch.int32) + 127) << 23).view(torch.float32)
 
 
+def hygon_baseline(
+    kv,
+    k_cache,
+    slot_mapping,
+    position_ids,
+    cos_sin_cache,
+    cache_block_size,
+    fp8_scale=None,
+    kv_mxfp8=False,
+):
+    """Pinned official LightOp HIP writer plus necessary interface adaptation.
+
+    The full-interface timing includes comparison/where for skipped positions.
+    No RoPE, quantization or cache write is implemented using Torch here.
+    """
+    global _hygon_entry
+    if k_cache.dtype != torch.uint8 or k_cache.shape[-1] != 584 or kv_mxfp8:
+        raise NotImplementedError("the official Hygon writer supports V4 packed only")
+    if _hygon_entry is None:
+        library = os.environ.get("KV_ROPE_HYGON_NATIVE_LIBRARY")
+        if not library:
+            raise RuntimeError(
+                "set KV_ROPE_HYGON_NATIVE_LIBRARY to the verified library"
+            )
+        if (
+            hashlib.sha256(Path(library).read_bytes()).hexdigest()
+            != HYGON_LIBRARY_SHA256
+        ):
+            raise RuntimeError("the verified Hygon native baseline library has changed")
+        torch.ops.load_library(library)
+        _hygon_entry = torch.ops._bao_hygon_baseline.packed_insert
+    count = slot_mapping.numel()
+    if count == 0 or cos_sin_cache.shape[0] == 0:
+        return
+    safe_positions = torch.where(slot_mapping >= 0, position_ids[:count], 0)
+    q = torch.empty((count, 0, 512), dtype=kv.dtype, device=kv.device)
+    return _hygon_entry(
+        q,
+        kv[:count],
+        k_cache,
+        slot_mapping,
+        safe_positions,
+        cos_sin_cache,
+        1e-6,
+        cache_block_size,
+    )
+
+
 def encode_e4m3(values):
     """Independent arithmetic E4M3 encoder; no device FP8 cast is needed.
 
@@ -206,7 +258,7 @@ def torch_reference(
             even.double() * sine.double() + (odd * cosine).double()
         ).float()
     elif _rope_fma_on_cos:
-        # The official MACA compiler contracts the cosine term in both outputs.
+        # The verified MACA, PPU and Hygon builds contract both cosine terms.
         rotated[:, 448::2] = torch.addcmul(
             -(pairs[:, :, 1] * sine), pairs[:, :, 0], cosine
         )
@@ -276,6 +328,32 @@ def mthreads_cpu_reference(
         fp8_scale.cpu() if fp8_scale is not None else None,
         kv_mxfp8,
         _rope_fma_on_even=True,
+    )
+    k_cache.copy_(cpu_cache)
+
+
+def hygon_cpu_reference(
+    kv,
+    k_cache,
+    slot_mapping,
+    position_ids,
+    cos_sin_cache,
+    cache_block_size,
+    fp8_scale=None,
+    kv_mxfp8=False,
+):
+    """CPU-only mathematical oracle; never a performance baseline."""
+    cpu_cache = k_cache.cpu()
+    torch_reference(
+        kv.cpu(),
+        cpu_cache,
+        slot_mapping.cpu(),
+        position_ids.cpu(),
+        cos_sin_cache.cpu(),
+        cache_block_size,
+        fp8_scale.cpu() if fp8_scale is not None else None,
+        kv_mxfp8,
+        _rope_fma_on_cos=True,
     )
     k_cache.copy_(cpu_cache)
 

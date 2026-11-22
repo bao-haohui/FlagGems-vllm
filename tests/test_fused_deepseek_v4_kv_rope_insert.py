@@ -22,6 +22,7 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     build_inputs,
     encode_e4m3,
+    hygon_cpu_reference,
     mthreads_cpu_reference,
     native,
     torch_reference,
@@ -32,10 +33,13 @@ from . import conftest as cfg
 
 VLLM_REF = native(flaggems_vllm.device)
 TORCH_REF = functools.partial(
-    torch_reference, _rope_fma_on_cos=flaggems_vllm.vendor_name in ("metax", "thead")
+    torch_reference,
+    _rope_fma_on_cos=flaggems_vllm.vendor_name in ("metax", "thead", "hygon"),
 )
 if flaggems_vllm.vendor_name == "mthreads":
     TORCH_REF = mthreads_cpu_reference
+elif flaggems_vllm.vendor_name == "hygon":
+    TORCH_REF = hygon_cpu_reference
 REFERENCE = VLLM_REF or TORCH_REF
 
 # Functional coverage retains DP padding and upstream's 256-token page cases.
@@ -295,7 +299,7 @@ def test_noncontiguous_token_stride(cache_format):
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_public_api_selects_backend_override():
     vendor = flaggems_vllm.vendor_name
-    if vendor not in ("ascend", "metax", "thead", "mthreads"):
+    if vendor not in ("ascend", "metax", "thead", "mthreads", "hygon"):
         pytest.skip("Backend override dispatch check")
     assert f"._{vendor}.ops." in (
         flaggems_vllm.fused_deepseek_v4_kv_rope_insert.__module__
@@ -306,7 +310,13 @@ def test_public_api_selects_backend_override():
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @pytest.mark.parametrize("all_skipped", [False, True])
 def test_skipped_positions_are_not_read(cache_format, all_skipped):
-    if flaggems_vllm.vendor_name not in ("ascend", "metax", "thead", "mthreads"):
+    if flaggems_vllm.vendor_name not in (
+        "ascend",
+        "metax",
+        "thead",
+        "mthreads",
+        "hygon",
+    ):
         pytest.skip("Backend extensions allow invalid positions on skipped rows")
     slots = torch.tensor([3, -7, 1, -99, 8], device=flaggems_vllm.device)
     if all_skipped:
@@ -440,7 +450,7 @@ def test_per_tensor_fp8_does_not_round_rope_through_bf16():
 def test_native_rope_fma_order(
     cache_format, even, odd, cosine, sine, dimension, expected_value, scale
 ):
-    if flaggems_vllm.vendor_name not in ("metax", "thead"):
+    if flaggems_vllm.vendor_name not in ("metax", "thead", "hygon"):
         pytest.skip("Vendor native cosine FMA contraction order")
     inputs = _make_inputs(1, 1, 32, cache_format, scale_value=scale)
     inputs["kv"].zero_()
@@ -470,7 +480,7 @@ def test_native_rope_fma_order(
     "cosine,sine", [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
 )
 def test_native_rope_signed_zeros(cache_format, cosine, sine):
-    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads"):
+    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads", "hygon"):
         pytest.skip("Native RoPE signed-zero regression")
     slots = torch.arange(17, device=flaggems_vllm.device)
     inputs = _make_inputs(20, 17, 32, cache_format, scale_value=1.0, slot_mapping=slots)
@@ -500,7 +510,7 @@ def test_native_rope_signed_zeros(cache_format, cosine, sine):
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("invalid", ["token_stride", "page_stride", "alignment"])
 def test_backend_rejects_unsupported_packed_layout(invalid):
-    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads"):
+    if flaggems_vllm.vendor_name not in ("metax", "thead", "mthreads", "hygon"):
         pytest.skip("Backend packed-layout validation")
     inputs = _make_inputs(4, 4, 32, "packed_v4")
     shape = inputs["k_cache"].shape
@@ -588,7 +598,7 @@ def test_reference_encoder_matches_cpu_at_fp8_midpoints():
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_thead_encoder_all_finite_fp16_values():
-    if flaggems_vllm.vendor_name not in ("thead", "mthreads"):
+    if flaggems_vllm.vendor_name not in ("thead", "mthreads", "hygon"):
         pytest.skip("Backend E4M3 conversion sweep")
     values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
     values = values[torch.isfinite(values)].float()
@@ -613,7 +623,7 @@ def test_thead_encoder_all_finite_fp16_values():
 
 @pytest.mark.fused_deepseek_v4_kv_rope_insert
 def test_thead_ue8m0_all_positive_finite_bf16_maxima():
-    if flaggems_vllm.vendor_name not in ("thead", "mthreads"):
+    if flaggems_vllm.vendor_name not in ("thead", "mthreads", "hygon"):
         pytest.skip("Backend integer UE8M0 exponent sweep")
     maxima = (
         torch.arange(0x7F80, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
@@ -640,7 +650,7 @@ def test_thead_ue8m0_all_positive_finite_bf16_maxima():
     codes = pages[:, 32 * 576 :].reshape(-1, 8)[:count, :7].reshape(-1)
     exponent = torch.ceil(torch.log2(maxima.float().clamp_min(1e-4) / 448))
     assert torch.equal(codes[: maxima.numel()], (exponent + 127).to(torch.uint8))
-    if flaggems_vllm.vendor_name == "mthreads":
+    if flaggems_vllm.vendor_name in ("mthreads", "hygon"):
         padded_exponent = torch.ceil(torch.log2(padded.float().clamp_min(1e-4) / 448))
         expected = encode_e4m3(padded.float() * torch.exp2(-padded_exponent))
         expected = expected.reshape(count, 7, 1).expand(count, 7, 64)

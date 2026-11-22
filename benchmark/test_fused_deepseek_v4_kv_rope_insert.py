@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 
@@ -20,6 +22,7 @@ from baseline.fused_deepseek_v4_kv_rope_insert import (
     CACHE_FORMATS,
     OP_NAME,
     build_inputs,
+    hygon_baseline,
     mthreads_baseline,
     native,
 )
@@ -34,6 +37,11 @@ if flaggems_vllm.vendor_name == "mthreads":
     import torchada  # noqa: F401
 
     VLLM_REF = mthreads_baseline
+    BENCHMARK_FORMATS = ("packed_v4",)
+elif flaggems_vllm.vendor_name == "hygon":
+    VLLM_REF = (
+        hygon_baseline if os.environ.get("KV_ROPE_HYGON_NATIVE_LIBRARY") else None
+    )
     BENCHMARK_FORMATS = ("packed_v4",)
 
 pytestmark = [
@@ -68,6 +76,8 @@ def test_fused_deepseek_v4_kv_rope_insert(cache_format):
     label = f"vLLM native ({flaggems_vllm.vendor_name})"
     if flaggems_vllm.vendor_name == "mthreads":
         label = "official vllm-musa Triton (zero Q)"
+    elif flaggems_vllm.vendor_name == "hygon":
+        label = "official LightOp HIP (zero Q, safe positions)"
     print("baseline:", label, "cache_format:", cache_format)
     original_str = base.BenchmarkResult.__str__
 

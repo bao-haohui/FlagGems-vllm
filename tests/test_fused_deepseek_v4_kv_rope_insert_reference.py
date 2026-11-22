@@ -89,6 +89,45 @@ def test_missing_explicit_native_does_not_fall_back(monkeypatch):
         native("cuda")
 
 
+def test_hygon_baseline_rejects_unverified_library(monkeypatch, tmp_path):
+    from baseline import fused_deepseek_v4_kv_rope_insert as contract
+
+    library = tmp_path / "unverified.so"
+    library.write_bytes(b"not the verified official Hygon library")
+    monkeypatch.setenv("KV_ROPE_HYGON_NATIVE_LIBRARY", str(library))
+    monkeypatch.setattr(contract, "_hygon_entry", None)
+    args, _ = contract.build_inputs(
+        dict(
+            num_tokens=1,
+            num_tokens_insert=1,
+            cache_block_size=32,
+            cache_format="packed_v4",
+        ),
+        torch.bfloat16,
+        "cpu",
+    )
+    with pytest.raises(RuntimeError, match="baseline library has changed"):
+        contract.hygon_baseline(*args)
+
+
+@pytest.mark.parametrize("cache_format", ["bf16", "fp8", "mxfp8"])
+def test_hygon_baseline_does_not_claim_other_formats(cache_format):
+    from baseline import fused_deepseek_v4_kv_rope_insert as contract
+
+    args, _ = contract.build_inputs(
+        dict(
+            num_tokens=1,
+            num_tokens_insert=1,
+            cache_block_size=32,
+            cache_format=cache_format,
+        ),
+        torch.bfloat16,
+        "cpu",
+    )
+    with pytest.raises(NotImplementedError, match="V4 packed only"):
+        contract.hygon_baseline(*args)
+
+
 def test_explicit_native_library_errors_are_not_suppressed(monkeypatch):
     monkeypatch.setenv("KV_ROPE_NATIVE_LIBRARY", "/missing/kv_rope/native.so")
     monkeypatch.delenv("KV_ROPE_NATIVE_NAMESPACE", raising=False)

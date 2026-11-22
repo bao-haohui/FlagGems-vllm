@@ -21,6 +21,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_r
 from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_deepseek_v4_kv_rope_insert import (
+    fused_deepseek_v4_kv_rope_insert,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -53,6 +56,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 )
 
 __all__ = [
+    "fused_deepseek_v4_kv_rope_insert",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
